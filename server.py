@@ -1399,10 +1399,10 @@ async def mobile():
 <script>
   const DEVICE_NAME = 'greenhouse-01';
   const PRESETS = [
-    { label: '5m', seconds: 300 },
-    { label: '15m', seconds: 900 },
-    { label: '30m', seconds: 1800 },
-    { label: '1h', seconds: 3600 },
+    { label: '1s', seconds: 1 },
+    { label: '3s', seconds: 3 },
+    { label: '10s', seconds: 10 },
+    { label: '1m', seconds: 60 },
   ];
   const METRICS = [
     { key: 'temperatura', label: 'Temperature', unit: '°C', color: '#7cf7c1', format: v => `${v.toFixed(1)} °C`, source: v => v },
