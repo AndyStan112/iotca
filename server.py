@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import secrets
+import hmac
+import hashlib
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -19,6 +21,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "iotca_session")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+SESSION_SECRET = os.getenv("SESSION_SECRET") or ADMIN_PASSWORD
+ALLOWED_DEVICE_NAMES = {"greenhouse-01"}
 
 if not DATABASE_URL:
     raise SystemExit("DATABASE_URL is required in .env")
@@ -27,8 +31,6 @@ if not ADMIN_PASSWORD:
     raise SystemExit("ADMIN_PASSWORD is required in .env")
 
 app = FastAPI(title="IoT Control Server")
-
-_sessions: dict[str, float] = {}
 
 
 def get_db_connection():
@@ -55,6 +57,28 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _sign_session_payload(payload: str) -> str:
+    secret = SESSION_SECRET.encode("utf-8")
+    body = payload.encode("utf-8")
+    sig = hmac.new(secret, body, hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def _verify_session_token(token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    payload, sig = token.rsplit(".", 1)
+    expected = hmac.new(SESSION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return False
+    try:
+        expires_at_str, _nonce = payload.split(":", 1)
+        expires_at = int(expires_at_str)
+    except ValueError:
+        return False
+    return expires_at >= int(time.time())
+
+
 def get_request_token(request: Request) -> str | None:
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
@@ -63,15 +87,7 @@ def get_request_token(request: Request) -> str | None:
 
 
 def is_session_valid(token: str | None) -> bool:
-    if not token:
-        return False
-    expires_at = _sessions.get(token)
-    if not expires_at:
-        return False
-    if expires_at < time.time():
-        _sessions.pop(token, None)
-        return False
-    return True
+    return _verify_session_token(token)
 
 
 def require_admin_session(request: Request):
@@ -82,8 +98,9 @@ def require_admin_session(request: Request):
 
 
 def create_session_response(payload: dict[str, Any], token: str | None = None) -> JSONResponse:
-    session_token = token or secrets.token_urlsafe(32)
-    _sessions[session_token] = time.time() + SESSION_TTL_SECONDS
+    expires_at = int(time.time()) + SESSION_TTL_SECONDS
+    session_payload = token or f"{expires_at}:{secrets.token_urlsafe(16)}"
+    session_token = _sign_session_payload(session_payload)
     response = JSONResponse(payload)
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
@@ -121,6 +138,8 @@ def load_device_by_name(conn, device_name: str):
 
 
 def ensure_device_for_device_token(conn, device_name: str, device_token: str, metadata: dict[str, Any] | None = None):
+    if device_name not in ALLOWED_DEVICE_NAMES:
+        raise HTTPException(status_code=403, detail="Device not allowed")
     existing = load_device_by_name(conn, device_name)
     with conn.cursor() as cur:
         if existing:
@@ -144,6 +163,8 @@ def ensure_device_for_device_token(conn, device_name: str, device_token: str, me
 
 
 def require_device_for_name(conn, device_name: str, device_token: str):
+    if device_name not in ALLOWED_DEVICE_NAMES:
+        raise HTTPException(status_code=403, detail="Device not allowed")
     device = load_device_by_name(conn, device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -245,9 +266,6 @@ async def login(request: Request):
 
 @app.post("/api/logout")
 async def logout(request: Request):
-    token = get_request_token(request)
-    if token:
-        _sessions.pop(token, None)
     return clear_session_response({"status": "ok"})
 
 
@@ -373,18 +391,6 @@ async def claim_commands(request: Request):
     with db_session() as conn:
         device = require_device_for_name(conn, device_name, device_token)
         rows = get_pending_commands(conn, device["id"], limit=max(1, min(limit, 50)))
-        if rows:
-            ids = [row["id"] for row in rows]
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE commands
-                    SET status = 'sent',
-                        sent_at = now()
-                    WHERE id = ANY(%s::bigint[])
-                    """,
-                    (ids,),
-                )
     return JSONResponse(jsonable_encoder({"device_name": device_name, "rows": rows}))
 
 

@@ -33,6 +33,7 @@ If the mini-server restarts, the exporter just retries on the next interval.
 ```env
 DATABASE_URL=postgresql://user:password@host:5432/dbname
 ADMIN_PASSWORD=choose-a-password
+SESSION_SECRET=optional-long-random-secret
 SERVER_HOST=0.0.0.0
 SERVER_PORT=5000
 SESSION_COOKIE_NAME=iotca_session
@@ -60,6 +61,8 @@ PI_CAMERA_PATH=/tmp/local_plant.jpg
 SENSOR_FALLBACK_TEMP=24.5
 SENSOR_FALLBACK_HUMIDITY=55.0
 ```
+
+For now the cloud only accepts telemetry from `greenhouse-01`.
 
 ## Install
 
