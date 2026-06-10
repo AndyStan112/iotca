@@ -678,7 +678,9 @@ async def index():
     try { data = text ? JSON.parse(text) : {}; } catch (err) { data = { raw: text }; }
     if (!response.ok) {
       const error = data.detail || data.error || response.statusText;
-      throw new Error(error);
+      const err = new Error(error);
+      err.status = response.status;
+      throw err;
     }
     return data;
   }
@@ -714,16 +716,35 @@ async def index():
   }
 
   async function bootstrap() {
-    const me = await api('/api/me', { method: 'GET' });
-    if (!me.authenticated) {
+    try {
+      const me = await api('/api/me', { method: 'GET' });
+      if (!me.authenticated) {
+        showLogin('');
+        return;
+      }
+      showDashboard();
+      await loadDevices();
+      await refreshAll();
+      if (refreshInterval) window.clearInterval(refreshInterval);
+      refreshInterval = window.setInterval(() => refreshAll().catch(handleRefreshError), 5000);
+    } catch (err) {
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+        return;
+      }
+      showDashboard();
+      document.getElementById('command-result').textContent = `Startup error: ${err.message}`;
+      console.error(err);
+    }
+  }
+
+  function handleRefreshError(err) {
+    if (err && (err.status === 401 || err.status === 403)) {
       showLogin('');
       return;
     }
-    showDashboard();
-    await loadDevices();
-    await refreshAll();
-    if (refreshInterval) window.clearInterval(refreshInterval);
-    refreshInterval = window.setInterval(() => refreshAll().catch(console.error), 5000);
+    document.getElementById('command-result').textContent = `Refresh error: ${err.message}`;
+    console.error(err);
   }
 
   async function loadDevices() {
@@ -763,7 +784,7 @@ async def index():
 
   function debouncedRefresh() {
     if (debounceHandle) window.clearTimeout(debounceHandle);
-    debounceHandle = window.setTimeout(() => refreshAll().catch(console.error), 350);
+    debounceHandle = window.setTimeout(() => refreshAll().catch(handleRefreshError), 350);
   }
 
   function renderMetrics(rows) {
@@ -824,11 +845,15 @@ async def index():
       document.getElementById('command-result').textContent = `Command ${result.command_id} sent successfully.`;
       await refreshAll();
     } catch (err) {
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+        return;
+      }
       document.getElementById('command-result').textContent = err.message;
     }
   }
 
-  bootstrap().catch(err => showLogin(err.message));
+  bootstrap().catch(console.error);
 </script>
 </body>
 </html>
