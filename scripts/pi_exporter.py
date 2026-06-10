@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
 from dotenv import load_dotenv
@@ -83,6 +84,70 @@ def post_telemetry(data):
     return response.json()
 
 
+def claim_commands(limit: int = 10):
+    url = SERVER_URL.rstrip("/") + "/api/commands/claim"
+    response = requests.post(
+        url,
+        headers=HEADERS,
+        json={"device_name": DEVICE_NAME, "limit": limit},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("rows") or []
+
+
+def execute_local_command(command: str, parameters: dict[str, Any]):
+    url = LOCAL_PI_URL.rstrip("/") + "/api/control"
+    response = requests.post(
+        url,
+        headers=PI_HEADERS,
+        json={"command": command, "parameters": parameters},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def ack_command(command_id: int, status: str, result: dict[str, Any]):
+    url = SERVER_URL.rstrip("/") + "/api/commands/ack"
+    response = requests.post(
+        url,
+        headers=HEADERS,
+        json={
+            "device_name": DEVICE_NAME,
+            "command_id": command_id,
+            "status": status,
+            "result": result,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def process_commands():
+    commands = claim_commands()
+    if not commands:
+        return
+
+    for command_row in commands:
+        command_id = command_row["id"]
+        command = command_row["command"]
+        parameters = command_row.get("parameters") or {}
+        try:
+            result = execute_local_command(command, parameters)
+            ack_command(command_id, "completed", result)
+            print(f"Command {command_id} executed:", result)
+        except Exception as exc:
+            error_result = {"error": str(exc)}
+            try:
+                ack_command(command_id, "failed", error_result)
+            except Exception as ack_exc:
+                print(f"Failed to ack command {command_id}:", ack_exc)
+            print(f"Command {command_id} failed:", exc)
+
+
 def main():
     print(f"Starting Raspberry exporter for {DEVICE_NAME}")
     while True:
@@ -95,6 +160,11 @@ def main():
             break
         except Exception as exc:
             print("Exporter error:", exc)
+
+        try:
+            process_commands()
+        except Exception as exc:
+            print("Command processing error:", exc)
 
         time.sleep(DATA_INTERVAL_SECONDS)
 

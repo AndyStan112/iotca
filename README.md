@@ -3,13 +3,13 @@
 This project splits the system into three parts:
 
 - `pi_mini_server.py` runs on the Pi and owns the hardware.
-- `scripts/pi_exporter.py` runs on the Pi and periodically exports sensor state to the cloud database.
-- `server.py` runs in the cloud and provides the password-gated UI plus command forwarding.
+- `scripts/pi_exporter.py` runs on the Pi and periodically exports sensor state to the cloud database, then polls and executes pending commands.
+- `server.py` runs in the cloud and provides the password-gated UI plus command storage.
 
 The two Pi-side processes are intentional:
 
 - the mini-server is the local hardware API
-- the exporter is the scheduled bridge that reads the local API and writes telemetry to PostgreSQL
+- the exporter is the scheduled bridge that reads the local API, writes telemetry to PostgreSQL, and pulls commands from the cloud
 
 The database schema in `migrations/` is left unchanged.
 
@@ -18,7 +18,7 @@ The database schema in `migrations/` is left unchanged.
 - The Pi mini-server exposes `/api/status`, `/api/data`, `/api/control`, and `/api/camera`.
 - The exporter polls the Pi mini-server locally, then posts telemetry to the cloud server.
 - The cloud server stores telemetry in `measurements` and command history in `commands`.
-- When you log in to the cloud UI, the backend forwards commands to the Pi with `PI_TOKEN`.
+- When you log in to the cloud UI, the backend stores commands in the database and the Pi pulls them on its next export cycle.
 
 ## Why both Pi processes exist
 
@@ -33,11 +33,8 @@ If the mini-server restarts, the exporter just retries on the next interval.
 ```env
 DATABASE_URL=postgresql://user:password@host:5432/dbname
 ADMIN_PASSWORD=choose-a-password
-PI_BASE_URL=http://raspberry-pi-host:6000
-PI_TOKEN=secret-pi-token
 SERVER_HOST=0.0.0.0
 SERVER_PORT=5000
-REQUEST_TIMEOUT=10.0
 SESSION_COOKIE_NAME=iotca_session
 SESSION_TTL_SECONDS=86400
 ```
@@ -105,4 +102,4 @@ uv run python3 scripts/pi_exporter.py
 
 - `old_server.py` is kept as a reference copy.
 - The Pi mini-server keeps the hardware comments and control semantics from the old monolithic server.
-- Commands are stored in the `commands` table before being forwarded, so you get a small audit trail in the cloud UI.
+- Commands are stored in the `commands` table and then claimed by the Pi exporter, so you get a small audit trail in the cloud UI without exposing the Pi directly.

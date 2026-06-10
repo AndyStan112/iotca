@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import json
 import os
 import secrets
 import time
@@ -9,7 +8,6 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
-import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -19,9 +17,6 @@ load_dotenv(dotenv_path=".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-PI_BASE_URL = os.getenv("PI_BASE_URL", "http://127.0.0.1:6000")
-PI_TOKEN = os.getenv("PI_TOKEN")
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10.0"))
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "iotca_session")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 
@@ -30,9 +25,6 @@ if not DATABASE_URL:
 
 if not ADMIN_PASSWORD:
     raise SystemExit("ADMIN_PASSWORD is required in .env")
-
-if not PI_TOKEN:
-    raise SystemExit("PI_TOKEN is required in .env")
 
 app = FastAPI(title="IoT Control Server")
 
@@ -151,19 +143,13 @@ def ensure_device_for_device_token(conn, device_name: str, device_token: str, me
         return cur.fetchone()
 
 
-def get_device_metadata(device_row):
-    metadata = device_row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except json.JSONDecodeError:
-            metadata = {}
-    return metadata
-
-
-def resolve_pi_url(device_row):
-    metadata = get_device_metadata(device_row)
-    return metadata.get("pi_url") or PI_BASE_URL
+def require_device_for_name(conn, device_name: str, device_token: str):
+    device = load_device_by_name(conn, device_name)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if not device.get("device_key") or device["device_key"] != device_token:
+        raise HTTPException(status_code=401, detail="Invalid token for device")
+    return device
 
 
 def store_measurements(conn, device_id: int, recorded_at, metrics: list[dict[str, Any]]):
@@ -233,25 +219,19 @@ def get_recent_commands(conn, device_id: int, limit: int = 25):
         return cur.fetchall()
 
 
-def send_command_to_pi(device_row, command: str, parameters: dict[str, Any], command_id: int):
-    pi_url = resolve_pi_url(device_row)
-    payload = {
-        "device_name": device_row["device_name"],
-        "command": command,
-        "parameters": parameters,
-        "command_id": command_id,
-    }
-    response = requests.post(
-        f"{pi_url.rstrip('/')}/api/control",
-        headers={
-            "Authorization": f"Bearer {PI_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+def get_pending_commands(conn, device_id: int, limit: int = 25):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, command, parameters, status, created_at, sent_at, acknowledged_at, result
+            FROM commands
+            WHERE device_id = %s AND status = 'pending'
+            ORDER BY created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (device_id, limit),
+        )
+        return cur.fetchall()
 
 
 @app.post("/api/login")
@@ -378,8 +358,75 @@ async def list_commands(request: Request, device_name: str, limit: int = 25, _: 
     return JSONResponse(jsonable_encoder({"device_name": device_name, "rows": rows}))
 
 
+@app.post("/api/commands/claim")
+async def claim_commands(request: Request):
+    data = await request.json()
+    device_name = data.get("device_name")
+    device_token = get_request_token(request)
+    limit = int(data.get("limit") or 10)
+
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if not device_token:
+        raise HTTPException(status_code=401, detail="Missing device token")
+
+    with db_session() as conn:
+        device = require_device_for_name(conn, device_name, device_token)
+        rows = get_pending_commands(conn, device["id"], limit=max(1, min(limit, 50)))
+        if rows:
+            ids = [row["id"] for row in rows]
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE commands
+                    SET status = 'sent',
+                        sent_at = now()
+                    WHERE id = ANY(%s::bigint[])
+                    """,
+                    (ids,),
+                )
+    return JSONResponse(jsonable_encoder({"device_name": device_name, "rows": rows}))
+
+
+@app.post("/api/commands/ack")
+async def ack_command(request: Request):
+    data = await request.json()
+    device_name = data.get("device_name")
+    command_id = data.get("command_id")
+    status = str(data.get("status") or "completed")
+    result = data.get("result") or {}
+    device_token = get_request_token(request)
+
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if not device_token:
+        raise HTTPException(status_code=401, detail="Missing device token")
+    if command_id is None:
+        raise HTTPException(status_code=400, detail="command_id is required")
+
+    with db_session() as conn:
+        device = require_device_for_name(conn, device_name, device_token)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE commands
+                SET status = %s,
+                    acknowledged_at = now(),
+                    result = %s
+                WHERE id = %s AND device_id = %s
+                RETURNING id, command, parameters, status, created_at, sent_at, acknowledged_at, result
+                """,
+                (status, psycopg2.extras.Json(result), command_id, device["id"]),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return JSONResponse(jsonable_encoder({"status": "ok", "command": row}))
+
+
 @app.post("/api/command")
-async def forward_command(request: Request, _: bool = Depends(require_admin_session)):
+async def create_command(request: Request, _: bool = Depends(require_admin_session)):
     data = await request.json()
     device_name = data.get("device_name")
     command = data.get("command")
@@ -407,44 +454,10 @@ async def forward_command(request: Request, _: bool = Depends(require_admin_sess
             )
             command_row = cur.fetchone()
         conn.commit()
-
-        try:
-            pi_response = send_command_to_pi(device, command, parameters, command_row["id"])
-        except Exception as exc:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE commands
-                    SET status = 'failed',
-                        acknowledged_at = now(),
-                        result = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        psycopg2.extras.Json({"error": str(exc)}),
-                        command_row["id"],
-                    ),
-                )
-            conn.commit()
-            raise HTTPException(status_code=502, detail=f"Failed to forward command to Pi: {exc}") from exc
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE commands
-                SET status = 'sent',
-                    sent_at = now(),
-                    acknowledged_at = now(),
-                    result = %s
-                WHERE id = %s
-                """,
-                (psycopg2.extras.Json(pi_response), command_row["id"]),
-            )
-        conn.commit()
     finally:
         conn.close()
 
-    return JSONResponse({"status": "ok", "command_id": command_row["id"], "pi_response": pi_response})
+    return JSONResponse(jsonable_encoder({"status": "ok", "command_id": command_row["id"], "command": command}))
 
 
 @app.get("/")
@@ -545,7 +558,7 @@ async def index():
   <div class="wrap">
     <div id="login-card" class="card login">
       <h1 class="title">IoT Control Center</h1>
-      <p class="subtitle">Log in with the admin password to view telemetry and forward commands to the Raspberry Pi through the backend.</p>
+      <p class="subtitle">Log in with the admin password to view telemetry and queue commands in the cloud database.</p>
       <div class="stack">
         <div>
           <label for="password">Admin password</label>
@@ -562,7 +575,7 @@ async def index():
       <div class="hero">
         <div>
           <h1 class="title">IoT Control Center</h1>
-          <p class="subtitle">Telemetry lives in Postgres. Commands are authenticated in the UI, then forwarded to the Pi with the server-side token.</p>
+          <p class="subtitle">Telemetry lives in Postgres. Commands are authenticated in the UI, then picked up by the Pi exporter on its next poll.</p>
         </div>
         <div class="actions">
           <button class="ghost" onclick="refreshAll()">Refresh</button>
