@@ -789,14 +789,29 @@ async def index():
 
   function renderMetrics(rows) {
     const map = {};
+    let newestTimestamp = null;
     for (const row of rows) map[row.metric] = row.value;
+    for (const row of rows) {
+      const ts = Date.parse(row.recorded_at);
+      if (!Number.isNaN(ts) && (newestTimestamp === null || ts > newestTimestamp)) {
+        newestTimestamp = ts;
+      }
+    }
     document.getElementById('kpi-temp').textContent = map.temperatura ?? '--';
     document.getElementById('kpi-hum').textContent = map.umiditate ?? '--';
     document.getElementById('kpi-light').textContent = map.lumina ?? '--';
-    const pump = map.pompa;
-    const heat = map.incalzire;
-    const cool = map.racire;
-    document.getElementById('kpi-status').textContent = [pump, heat, cool].every(v => v !== undefined) ? 'online' : 'partial';
+    const ageSeconds = newestTimestamp === null ? null : Math.round((Date.now() - newestTimestamp) / 1000);
+    let status = 'offline';
+    if (ageSeconds !== null) {
+      if (ageSeconds <= 15) {
+        status = 'online';
+      } else if (ageSeconds <= 120) {
+        status = `stale (${ageSeconds}s)`;
+      } else {
+        status = `offline (${ageSeconds}s)`;
+      }
+    }
+    document.getElementById('kpi-status').textContent = status;
 
     const list = document.getElementById('metrics-list');
     list.innerHTML = rows.map(row => `
