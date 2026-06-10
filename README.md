@@ -39,7 +39,11 @@ SESSION_COOKIE_NAME=iotca_session
 SESSION_TTL_SECONDS=86400
 ```
 
-### Raspberry Pi exporter
+
+### Raspberry Pi shared env
+
+Both Pi-side processes can use the same `.env` file on the Raspberry Pi.
+`pi_mini_server.py` reads the hardware settings, and `scripts/pi_exporter.py` reads the telemetry and command settings from that same file.
 
 ```env
 SERVER_URL=https://your-cloud-server.example.com
@@ -49,12 +53,6 @@ LOCAL_PI_URL=http://127.0.0.1:6000
 PI_TOKEN=secret-pi-token
 DATA_INTERVAL_SECONDS=5
 REQUEST_TIMEOUT=10.0
-```
-
-### Raspberry Pi mini-server
-
-```env
-PI_TOKEN=secret-pi-token
 PI_SERVER_HOST=0.0.0.0
 PI_SERVER_PORT=6000
 PI_USB_HUB=3
