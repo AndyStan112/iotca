@@ -54,6 +54,7 @@ LOCAL_PI_URL=http://127.0.0.1:6000
 PI_TOKEN=secret-pi-token
 DATA_INTERVAL_SECONDS=5
 REQUEST_TIMEOUT=10.0
+UPLOAD_CAMERA_SNAPSHOT=true
 PI_SERVER_HOST=0.0.0.0
 PI_SERVER_PORT=6000
 PI_USB_HUB=3
@@ -63,6 +64,7 @@ SENSOR_FALLBACK_HUMIDITY=55.0
 ```
 
 For now the cloud only accepts telemetry from `greenhouse-01`.
+If `UPLOAD_CAMERA_SNAPSHOT` is on, the exporter also pushes the latest still image to the cloud so `/api/camera/latest` works for both the desktop UI and `/mobile`.
 
 ## Install
 
@@ -86,6 +88,8 @@ uv run python3 -m uvicorn server:app --host 0.0.0.0 --port 5000
 ```
 
 Open `/` in a browser, log in with `ADMIN_PASSWORD`, then use the dashboard to inspect telemetry and send commands.
+
+The mobile PWA lives at `/mobile`.
 
 ## Run the Raspberry Pi mini-server
 

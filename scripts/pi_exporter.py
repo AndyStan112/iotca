@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import time
@@ -19,6 +20,7 @@ LOCAL_PI_URL = os.getenv("LOCAL_PI_URL", "http://127.0.0.1:6000")
 PI_TOKEN = os.getenv("PI_TOKEN")
 DATA_INTERVAL_SECONDS = int(os.getenv("DATA_INTERVAL_SECONDS", "5"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10.0"))
+UPLOAD_CAMERA_SNAPSHOT = os.getenv("UPLOAD_CAMERA_SNAPSHOT", "true").lower() not in {"0", "false", "no"}
 
 if not SERVER_URL:
     print("ERROR: SERVER_URL is required in .env")
@@ -51,6 +53,13 @@ def fetch_local_status():
     return payload.get("data") or {}
 
 
+def fetch_local_camera_snapshot():
+    url = LOCAL_PI_URL.rstrip("/") + "/api/camera"
+    response = requests.get(url, headers=PI_HEADERS, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.content
+
+
 def build_telemetry():
     status = fetch_local_status()
 
@@ -80,6 +89,27 @@ def build_telemetry():
 def post_telemetry(data):
     url = SERVER_URL.rstrip("/") + "/api/telemetry"
     response = requests.post(url, headers=HEADERS, json=data, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+def post_camera_snapshot(image_bytes: bytes):
+    if not UPLOAD_CAMERA_SNAPSHOT:
+        return None
+    url = SERVER_URL.rstrip("/") + "/api/camera/snapshot"
+    payload = {
+        "device_name": DEVICE_NAME,
+        "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+    }
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {DEVICE_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
     response.raise_for_status()
     return response.json()
 
@@ -155,6 +185,13 @@ def main():
             telemetry = build_telemetry()
             result = post_telemetry(telemetry)
             print("Telemetry sent:", result)
+            try:
+                snapshot = fetch_local_camera_snapshot()
+                camera_result = post_camera_snapshot(snapshot)
+                if camera_result:
+                    print("Camera snapshot uploaded:", camera_result)
+            except Exception as exc:
+                print("Camera upload error:", exc)
         except KeyboardInterrupt:
             print("Exporter stopped by user")
             break
