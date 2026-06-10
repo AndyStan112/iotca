@@ -1,10 +1,15 @@
 # IoTCA Remote Control Split
 
-This project splits the Raspberry Pi setup into three parts:
+This project splits the system into three parts:
 
 - `pi_mini_server.py` runs on the Pi and owns the hardware.
-- `scripts/pi_exporter.py` runs on the Pi and pushes telemetry into PostgreSQL.
+- `scripts/pi_exporter.py` runs on the Pi and periodically exports sensor state to the cloud database.
 - `server.py` runs in the cloud and provides the password-gated UI plus command forwarding.
+
+The two Pi-side processes are intentional:
+
+- the mini-server is the local hardware API
+- the exporter is the scheduled bridge that reads the local API and writes telemetry to PostgreSQL
 
 The database schema in `migrations/` is left unchanged.
 
@@ -14,6 +19,12 @@ The database schema in `migrations/` is left unchanged.
 - The exporter polls the Pi mini-server locally, then posts telemetry to the cloud server.
 - The cloud server stores telemetry in `measurements` and command history in `commands`.
 - When you log in to the cloud UI, the backend forwards commands to the Pi with `PI_TOKEN`.
+
+## Why both Pi processes exist
+
+Keeping hardware control and data export separate makes the Pi side easier to restart and debug.
+If telemetry export breaks, the actuators and camera still work.
+If the mini-server restarts, the exporter just retries on the next interval.
 
 ## Environment
 
@@ -58,8 +69,11 @@ SENSOR_FALLBACK_HUMIDITY=55.0
 ## Install
 
 ```bash
-uv add fastapi psycopg2-binary python-dotenv requests uvicorn[standard]
+uv sync --frozen
 ```
+
+The dependencies are already declared in `pyproject.toml` and locked in `uv.lock`.
+If you change dependencies later, update those files and run `uv sync` again.
 
 ## Apply migrations
 
