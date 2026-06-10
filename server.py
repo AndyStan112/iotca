@@ -18,6 +18,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 
+from iotca_store import get_recent_measurements as store_get_recent_measurements
+from iotca_store import load_device_by_name as store_load_device_by_name
+from iotca_store import summarize_recent_measurements
+from mobile_ai import run_chat as run_mobile_chat
+from mobile_ai import run_analysis as run_mobile_analysis
+
 load_dotenv(dotenv_path=".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -288,6 +294,26 @@ def leaf_favicon_svg() -> str:
     """.strip()
 
 
+MOBILE_DEVICE_NAME = "greenhouse-01"
+
+
+def load_mobile_ai_context(window_points: int):
+    window_points = max(1, int(window_points))
+    with db_session() as conn:
+        device = store_load_device_by_name(conn, MOBILE_DEVICE_NAME)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        recent_rows = store_get_recent_measurements(conn, MOBILE_DEVICE_NAME, limit=500)
+        summary = summarize_recent_measurements(recent_rows, window_points=window_points)
+
+    return {
+        "device_name": MOBILE_DEVICE_NAME,
+        "window_points": window_points,
+        "summary": summary,
+        "latest_rows": recent_rows[-8:],
+    }
+
+
 @app.post("/api/login")
 async def login(request: Request):
     data = await request.json()
@@ -546,6 +572,54 @@ async def create_command(request: Request, _: bool = Depends(require_admin_sessi
         conn.close()
 
     return JSONResponse(jsonable_encoder({"status": "ok", "command_id": command_row["id"], "command": command}))
+
+
+@app.get("/api/mobile/context")
+async def mobile_context(window_points: int = 10, _: bool = Depends(require_admin_session)):
+    return JSONResponse(jsonable_encoder({"status": "ok", **load_mobile_ai_context(window_points)}))
+
+
+@app.post("/api/mobile/chat")
+async def mobile_chat(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    message = str(data.get("message") or "").strip()
+    window_points = int(data.get("window_points") or 10)
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    context = load_mobile_ai_context(window_points)
+    snapshot_path = camera_snapshot_path(MOBILE_DEVICE_NAME)
+    session_id = get_request_token(request)
+    reply = await run_mobile_chat(
+        database_url=DATABASE_URL,
+        device_name=MOBILE_DEVICE_NAME,
+        message=message,
+        window_summary=context,
+        latest_rows=context["latest_rows"],
+        snapshot_path=snapshot_path if snapshot_path.exists() else None,
+        session_id=session_id,
+    )
+    return JSONResponse({"status": "ok", "reply": reply})
+
+
+@app.post("/api/mobile/analyze")
+async def mobile_analyze(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    message = str(data.get("message") or "").strip()
+    window_points = int(data.get("window_points") or 10)
+    context = load_mobile_ai_context(window_points)
+    snapshot_path = camera_snapshot_path(MOBILE_DEVICE_NAME)
+    session_id = get_request_token(request)
+    analysis = await run_mobile_analysis(
+        database_url=DATABASE_URL,
+        device_name=MOBILE_DEVICE_NAME,
+        message=message,
+        window_summary=context,
+        latest_rows=context["latest_rows"],
+        snapshot_path=snapshot_path if snapshot_path.exists() else None,
+        session_id=session_id,
+    )
+    return JSONResponse({"status": "ok", "analysis": analysis})
 
 
 @app.get("/")
@@ -1207,6 +1281,84 @@ async def mobile():
     .duration-custom input, .duration-custom select {
       padding: 11px 12px;
     }
+    .ai-controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .ai-controls textarea {
+      min-height: 92px;
+      resize: vertical;
+    }
+    .chat-log {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 12px;
+      max-height: 280px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .chat-bubble {
+      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+    }
+    .chat-bubble.user {
+      background: rgba(124, 247, 193, 0.08);
+      border-color: rgba(124, 247, 193, 0.18);
+    }
+    .chat-bubble.assistant {
+      background: rgba(118, 183, 255, 0.08);
+      border-color: rgba(118, 183, 255, 0.18);
+    }
+    .chat-role {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .analysis-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .analysis-item {
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+    }
+    .analysis-item.full {
+      grid-column: 1 / -1;
+    }
+    .analysis-item .label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-bottom: 8px;
+    }
+    .analysis-item ul {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 6px;
+    }
+    .analysis-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(124, 247, 193, 0.12);
+      border: 1px solid rgba(124, 247, 193, 0.2);
+      font-size: 0.8rem;
+      margin-bottom: 8px;
+    }
+    .mic-btn.listening {
+      box-shadow: 0 0 0 2px rgba(255, 209, 102, 0.24) inset;
+      border-color: rgba(255, 209, 102, 0.5);
+    }
     .chart {
       width: 100%;
       height: 180px;
@@ -1327,6 +1479,35 @@ async def mobile():
       <section class="card">
         <div class="status-line" style="margin-bottom:12px;">
           <div>
+            <h2>AI assistant</h2>
+            <p class="small">Chat is plain text. Analysis uses the current plant image plus the selected smoothing window.</p>
+          </div>
+          <div class="badge" id="speech-status">Speech: idle</div>
+        </div>
+        <div class="stack">
+          <div id="chat-log" class="chat-log"></div>
+          <textarea id="ai-input" placeholder="Ask about the plant, the readings, or what to do next..."></textarea>
+          <div class="ai-controls">
+            <button class="primary" onclick="sendChat()">Send chat</button>
+            <button id="mic-btn" class="ghost mic-btn" onclick="toggleSpeechInput()">🎙️ Voice input</button>
+            <button class="ghost" onclick="sendAnalysis()">AI analysis</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="status-line" style="margin-bottom:12px;">
+          <div>
+            <h2>AI analysis</h2>
+            <p class="small">Structured output rendered as cards, not raw JSON.</p>
+          </div>
+        </div>
+        <div id="analysis-result" class="analysis-grid"></div>
+      </section>
+
+      <section class="card">
+        <div class="status-line" style="margin-bottom:12px;">
+          <div>
             <h2>Actuators</h2>
             <p class="small">Use icon buttons. Duration presets and a custom timer are available for timed ON actions.</p>
           </div>
@@ -1414,6 +1595,9 @@ async def mobile():
   let cameraTimer = null;
   let seriesData = {};
   let selectedPreset = PRESETS[0].seconds;
+  let recognition = null;
+  let listening = false;
+  let chatHistory = [];
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -1468,6 +1652,142 @@ async def mobile():
     }
   }
 
+  function appendChat(role, text) {
+    const log = document.getElementById('chat-log');
+    const bubble = document.createElement('div');
+    bubble.className = `chat-bubble ${role}`;
+    bubble.innerHTML = `<div class="chat-role">${role}</div><div>${escapeHtml(text).replace(/\\n/g, '<br>')}</div>`;
+    log.appendChild(bubble);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function renderAnalysis(analysis) {
+    const target = document.getElementById('analysis-result');
+    const safe = analysis || {};
+    const status = safe.health_status || (safe.plant_looks_healthy ? 'healthy' : 'watch');
+    const observations = Array.isArray(safe.observations) ? safe.observations : [];
+    const suggestions = Array.isArray(safe.suggestions) ? safe.suggestions : [];
+    const concerns = Array.isArray(safe.concerns) ? safe.concerns : [];
+    target.innerHTML = `
+      <div class="analysis-item full">
+        <div class="analysis-badge">${safe.plant_looks_healthy ? 'Plant looks healthy' : 'Needs attention'}</div>
+        <div class="metric-value" style="font-size:1.25rem;">${status}</div>
+        <div class="small">Confidence: ${safe.confidence ?? '--'}%</div>
+      </div>
+      <div class="analysis-item full">
+        <div class="label">Summary</div>
+        <div>${escapeHtml(safe.summary || 'No summary returned.')}</div>
+      </div>
+      <div class="analysis-item">
+        <div class="label">Observations</div>
+        <ul>${observations.map(item => `<li>${escapeHtml(item)}</li>`).join('') || '<li>No observations returned.</li>'}</ul>
+      </div>
+      <div class="analysis-item">
+        <div class="label">Suggestions</div>
+        <ul>${suggestions.map(item => `<li>${escapeHtml(item)}</li>`).join('') || '<li>No suggestions returned.</li>'}</ul>
+      </div>
+      <div class="analysis-item full">
+        <div class="label">Concerns</div>
+        <ul>${concerns.map(item => `<li>${escapeHtml(item)}</li>`).join('') || '<li>No concerns returned.</li>'}</ul>
+      </div>
+    `;
+  }
+
+  async function sendChat() {
+    const input = document.getElementById('ai-input');
+    const message = input.value.trim();
+    if (!message) return;
+    input.value = '';
+    appendChat('user', message);
+    chatHistory.push({ role: 'user', text: message });
+    try {
+      const payload = await api('/api/mobile/chat', {
+        method: 'POST',
+        body: JSON.stringify({ message, window_points: Number(document.getElementById('window-size').value || 10) }),
+      });
+      const reply = payload.reply || '';
+      appendChat('assistant', reply);
+      chatHistory.push({ role: 'assistant', text: reply });
+    } catch (err) {
+      handleError(err);
+      appendChat('assistant', `Error: ${err.message}`);
+    }
+  }
+
+  async function sendAnalysis() {
+    const message = document.getElementById('ai-input').value.trim();
+    try {
+      const payload = await api('/api/mobile/analyze', {
+        method: 'POST',
+        body: JSON.stringify({ message, window_points: Number(document.getElementById('window-size').value || 10) }),
+      });
+      renderAnalysis(payload.analysis || {});
+    } catch (err) {
+      handleError(err);
+      renderAnalysis({
+        plant_looks_healthy: false,
+        health_status: 'watch',
+        summary: `Analysis failed: ${err.message}`,
+        observations: [],
+        suggestions: [],
+        concerns: [err.message],
+        confidence: 0,
+      });
+    }
+  }
+
+  function setSpeechStatus(message) {
+    const badge = document.getElementById('speech-status');
+    if (badge) badge.textContent = message;
+  }
+
+  function stopSpeech() {
+    listening = false;
+    const mic = document.getElementById('mic-btn');
+    if (mic) mic.classList.remove('listening');
+    setSpeechStatus('Speech: idle');
+    if (recognition) {
+      recognition.stop();
+    }
+  }
+
+  function toggleSpeechInput() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setSpeechStatus('Speech: unavailable');
+      return;
+    }
+    if (!recognition) {
+      recognition = new SR();
+      recognition.lang = navigator.language || 'en-US';
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.onresult = event => {
+        const transcript = Array.from(event.results).map(result => result[0].transcript).join(' ');
+        document.getElementById('ai-input').value = transcript.trim();
+      };
+      recognition.onerror = () => stopSpeech();
+      recognition.onend = () => stopSpeech();
+    }
+    if (listening) {
+      stopSpeech();
+      return;
+    }
+    listening = true;
+    document.getElementById('mic-btn').classList.add('listening');
+    setSpeechStatus('Speech: listening');
+    recognition.start();
+  }
+
   function durationSeconds() {
     const value = document.getElementById('custom-duration-value').value.trim();
     if (value) {
@@ -1505,6 +1825,9 @@ async def mobile():
       }
       showApp();
       populatePresetButtons();
+      if (!chatHistory.length) {
+        appendChat('assistant', 'Ask me about the plant, the recent readings, or press AI analysis for a structured health report.');
+      }
       await loadAndRender();
       await refreshCamera();
       if (refreshTimer) window.clearInterval(refreshTimer);
