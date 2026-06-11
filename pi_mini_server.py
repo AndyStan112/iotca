@@ -25,16 +25,10 @@ app = FastAPI(title="Raspberry Pi Mini Server")
 
 URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "3")  # Schimbă cu hub-ul tău (1 sau 3)
 
-try:
-    import board
-    import adafruit_dht
-    import digitalio
-    import smbus2
-except ImportError:
-    board = None
-    adafruit_dht = None
-    digitalio = None
-    smbus2 = None
+import board
+import adafruit_dht
+import digitalio
+import smbus2
 
 # Relee/MOSFET-uri Active-Low (True = OPRIT, False = PORNIT)
 heater = None
