@@ -426,7 +426,15 @@ async def latest_camera_snapshot(request: Request, device_name: str, _: bool = D
     snapshot_path = camera_snapshot_path(device_name)
     if not snapshot_path.exists():
         raise HTTPException(status_code=404, detail="No camera snapshot available")
-    return FileResponse(snapshot_path, media_type="image/jpeg")
+    return FileResponse(
+        snapshot_path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/recent")
@@ -1287,6 +1295,25 @@ async def mobile():
       flex-wrap: wrap;
       align-items: center;
     }
+    .loading-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      min-height: 24px;
+    }
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(124, 247, 193, 0.22);
+      border-top-color: var(--accent);
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
     .ai-controls textarea {
       min-height: 92px;
       resize: vertical;
@@ -1488,10 +1515,11 @@ async def mobile():
           <div id="chat-log" class="chat-log"></div>
           <textarea id="ai-input" placeholder="Ask about the plant, the readings, or what to do next..."></textarea>
           <div class="ai-controls">
-            <button class="primary" onclick="sendChat()">Send chat</button>
+            <button id="chat-btn" class="primary" onclick="sendChat()">Send chat</button>
             <button id="mic-btn" class="ghost mic-btn" onclick="toggleSpeechInput()">🎙️ Voice input</button>
-            <button class="ghost" onclick="sendAnalysis()">AI analysis</button>
+            <button id="analysis-btn" class="ghost" onclick="sendAnalysis()">AI analysis</button>
           </div>
+          <div id="ai-loading" class="loading-indicator" aria-live="polite"></div>
         </div>
       </section>
 
@@ -1598,6 +1626,7 @@ async def mobile():
   let recognition = null;
   let listening = false;
   let chatHistory = [];
+  let uiBusy = false;
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -1635,6 +1664,35 @@ async def mobile():
   function showApp() {
     document.getElementById('login-card').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
+  }
+
+  function setLoading(message = '', busy = false) {
+    uiBusy = busy;
+    const area = document.getElementById('ai-loading');
+    if (area) {
+      area.innerHTML = busy
+        ? `<span class="spinner"></span><span>${escapeHtml(message || 'Working...')}</span>`
+        : '';
+    }
+    const chatBtn = document.getElementById('chat-btn');
+    const analysisBtn = document.getElementById('analysis-btn');
+    const micBtn = document.getElementById('mic-btn');
+    if (chatBtn) chatBtn.disabled = busy;
+    if (analysisBtn) analysisBtn.disabled = busy;
+    if (micBtn) micBtn.disabled = busy;
+  }
+
+  function preserveScroll(fn) {
+    const scroller = document.scrollingElement || document.documentElement;
+    const top = scroller.scrollTop;
+    const left = scroller.scrollLeft;
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        window.requestAnimationFrame(() => {
+          scroller.scrollTo({ top, left, behavior: 'auto' });
+        });
+      });
   }
 
   function populatePresetButtons() {
@@ -1709,6 +1767,7 @@ async def mobile():
     input.value = '';
     appendChat('user', message);
     chatHistory.push({ role: 'user', text: message });
+    setLoading('Thinking...', true);
     try {
       const payload = await api('/api/mobile/chat', {
         method: 'POST',
@@ -1720,11 +1779,14 @@ async def mobile():
     } catch (err) {
       handleError(err);
       appendChat('assistant', `Error: ${err.message}`);
+    } finally {
+      setLoading('', false);
     }
   }
 
   async function sendAnalysis() {
     const message = document.getElementById('ai-input').value.trim();
+    setLoading('Analyzing plant health...', true);
     try {
       const payload = await api('/api/mobile/analyze', {
         method: 'POST',
@@ -1742,6 +1804,8 @@ async def mobile():
         concerns: [err.message],
         confidence: 0,
       });
+    } finally {
+      setLoading('', false);
     }
   }
 
@@ -1763,7 +1827,7 @@ async def mobile():
   function toggleSpeechInput() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
-      setSpeechStatus('Speech: unavailable');
+      setSpeechStatus('Speech: unavailable in this browser');
       return;
     }
     if (!recognition) {
@@ -1775,7 +1839,11 @@ async def mobile():
         const transcript = Array.from(event.results).map(result => result[0].transcript).join(' ');
         document.getElementById('ai-input').value = transcript.trim();
       };
-      recognition.onerror = () => stopSpeech();
+      recognition.onerror = event => {
+        const errorName = event && event.error ? event.error : 'unknown error';
+        setSpeechStatus(`Speech error: ${errorName}`);
+        stopSpeech();
+      };
       recognition.onend = () => stopSpeech();
     }
     if (listening) {
@@ -1825,6 +1893,7 @@ async def mobile():
       }
       showApp();
       populatePresetButtons();
+      configureSpeechUi();
       if (!chatHistory.length) {
         appendChat('assistant', 'Ask me about the plant, the recent readings, or press AI analysis for a structured health report.');
       }
@@ -1849,6 +1918,24 @@ async def mobile():
     }
     setSyncStatus(`Error: ${err.message}`);
     console.error(err);
+  }
+
+  function configureSpeechUi() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const micBtn = document.getElementById('mic-btn');
+    if (!SR) {
+      setSpeechStatus('Speech: unavailable in this browser');
+      if (micBtn) {
+        micBtn.disabled = true;
+        micBtn.title = 'This browser does not support the Web Speech API';
+      }
+      return;
+    }
+    setSpeechStatus('Speech: idle');
+    if (micBtn) {
+      micBtn.disabled = false;
+      micBtn.title = 'Voice input via the browser speech API';
+    }
   }
 
   function brightnessFromRaw(raw) {
@@ -2031,29 +2118,31 @@ async def mobile():
   }
 
   async function loadAndRender() {
-    const [latest, recent] = await Promise.all([
-      api(`/api/latest?device_name=${encodeURIComponent(DEVICE_NAME)}`, { method: 'GET' }),
-      api(`/api/recent?device_name=${encodeURIComponent(DEVICE_NAME)}&limit=500`, { method: 'GET' }),
-    ]);
-    document.getElementById('device-name').textContent = DEVICE_NAME;
-    seriesData = extractSeries(recent.rows || []);
-    renderMetrics(recent.rows || []);
-    renderCharts();
+    return preserveScroll(async () => {
+      const [latest, recent] = await Promise.all([
+        api(`/api/latest?device_name=${encodeURIComponent(DEVICE_NAME)}`, { method: 'GET' }),
+        api(`/api/recent?device_name=${encodeURIComponent(DEVICE_NAME)}&limit=500`, { method: 'GET' }),
+      ]);
+      document.getElementById('device-name').textContent = DEVICE_NAME;
+      seriesData = extractSeries(recent.rows || []);
+      renderMetrics(recent.rows || []);
+      renderCharts();
 
-    const latestRows = latest.rows || [];
-    let newestTimestamp = null;
-    for (const row of latestRows) {
-      const ts = Date.parse(row.recorded_at);
-      if (!Number.isNaN(ts) && (newestTimestamp === null || ts > newestTimestamp)) newestTimestamp = ts;
-    }
-    if (newestTimestamp) {
-      const ageSeconds = Math.round((Date.now() - newestTimestamp) / 1000);
-      if (ageSeconds <= 15) setSyncStatus(`Online · ${ageSeconds}s old`);
-      else if (ageSeconds <= 120) setSyncStatus(`Stale · ${ageSeconds}s old`);
-      else setSyncStatus(`Offline · ${ageSeconds}s old`);
-    } else {
-      setSyncStatus('No telemetry yet');
-    }
+      const latestRows = latest.rows || [];
+      let newestTimestamp = null;
+      for (const row of latestRows) {
+        const ts = Date.parse(row.recorded_at);
+        if (!Number.isNaN(ts) && (newestTimestamp === null || ts > newestTimestamp)) newestTimestamp = ts;
+      }
+      if (newestTimestamp) {
+        const ageSeconds = Math.round((Date.now() - newestTimestamp) / 1000);
+        if (ageSeconds <= 15) setSyncStatus(`Online · ${ageSeconds}s old`);
+        else if (ageSeconds <= 120) setSyncStatus(`Stale · ${ageSeconds}s old`);
+        else setSyncStatus(`Offline · ${ageSeconds}s old`);
+      } else {
+        setSyncStatus('No telemetry yet');
+      }
+    });
   }
 
   function currentDeviceUrl() {
