@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="$ROOT_DIR/logs"
 PID_DIR="$ROOT_DIR/run"
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -56,5 +57,10 @@ start_process() {
   echo "Log: $logfile"
 }
 
-start_process "pi_mini_server" uv run python3 -m uvicorn pi_mini_server:app --host 0.0.0.0 --port 6000
-start_process "pi_exporter" uv run python3 scripts/pi_exporter.py
+if [[ -x "$PYTHON_BIN" ]]; then
+  start_process "pi_mini_server" "$PYTHON_BIN" -m uvicorn pi_mini_server:app --host 0.0.0.0 --port 6000
+  start_process "pi_exporter" "$PYTHON_BIN" scripts/pi_exporter.py
+else
+  start_process "pi_mini_server" uv run python3 -m uvicorn pi_mini_server:app --host 0.0.0.0 --port 6000
+  start_process "pi_exporter" uv run python3 scripts/pi_exporter.py
+fi

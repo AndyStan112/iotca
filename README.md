@@ -109,6 +109,24 @@ The mobile PWA lives at `/mobile`.
 uv run python3 -m uvicorn pi_mini_server:app --host 0.0.0.0 --port 6000
 ```
 
+## Allow `pi` to control the pump
+
+The mini-server uses `uhubctl` to switch the pump hub on and off.
+If you run the service as the `pi` user, grant passwordless access to just that command:
+
+```bash
+sudo visudo -f /etc/sudoers.d/pi-uhubctl
+```
+
+Add a line like this, adjusting the path from `which uhubctl` if needed:
+
+```sudoers
+pi ALL=(root) NOPASSWD: /usr/bin/uhubctl -l 3 -a 0, /usr/bin/uhubctl -l 3 -a 1
+```
+
+If you run the mini-server as root, it will call `uhubctl` directly and skip `sudo`.
+That avoids the password prompt entirely, but running the whole app as root is broader than necessary.
+
 ## Run the Raspberry Pi exporter
 
 ```bash
