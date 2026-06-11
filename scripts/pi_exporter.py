@@ -53,11 +53,38 @@ def fetch_local_status():
     return payload.get("data") or {}
 
 
-def fetch_local_camera_snapshot():
+def fetch_device_config():
+    url = SERVER_URL.rstrip("/") + "/api/device/config"
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        params={"device_name": DEVICE_NAME},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("camera_defaults") or {}
+
+
+def fetch_local_camera_snapshot(camera_defaults: dict[str, Any] | None = None):
     url = LOCAL_PI_URL.rstrip("/") + "/api/camera"
-    response = requests.get(url, headers=PI_HEADERS, timeout=REQUEST_TIMEOUT)
+    response = requests.get(
+        url,
+        headers=PI_HEADERS,
+        params=camera_defaults or {},
+        timeout=REQUEST_TIMEOUT,
+    )
     response.raise_for_status()
     return response.content
+
+
+def merge_camera_defaults(base: dict[str, Any] | None, overrides: dict[str, Any] | None):
+    merged = dict(base or {})
+    for key, value in (overrides or {}).items():
+        if value is None or value == "":
+            continue
+        merged[key] = value
+    return merged
 
 
 def build_telemetry():
@@ -127,6 +154,19 @@ def claim_commands(limit: int = 10):
     return payload.get("rows") or []
 
 
+def schedule_due_recurring_jobs(limit: int = 20):
+    url = SERVER_URL.rstrip("/") + "/api/recurring-jobs/run-due"
+    response = requests.post(
+        url,
+        headers=HEADERS,
+        json={"device_name": DEVICE_NAME, "limit": limit},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("scheduled") or []
+
+
 def execute_local_command(command: str, parameters: dict[str, Any]):
     url = LOCAL_PI_URL.rstrip("/") + "/api/control"
     response = requests.post(
@@ -156,7 +196,7 @@ def ack_command(command_id: int, status: str, result: dict[str, Any]):
     return response.json()
 
 
-def process_commands():
+def process_commands(camera_defaults: dict[str, Any] | None = None):
     commands = claim_commands()
     if not commands:
         return
@@ -166,7 +206,17 @@ def process_commands():
         command = command_row["command"]
         parameters = command_row.get("parameters") or {}
         try:
-            result = execute_local_command(command, parameters)
+            if command == "camera_capture":
+                capture_params = merge_camera_defaults(camera_defaults, parameters)
+                snapshot = fetch_local_camera_snapshot(capture_params)
+                camera_result = post_camera_snapshot(snapshot)
+                result = {
+                    "status": "captured",
+                    "camera_defaults": capture_params,
+                    "camera_result": camera_result,
+                }
+            else:
+                result = execute_local_command(command, parameters)
             ack_command(command_id, "completed", result)
             print(f"Command {command_id} executed:", result)
         except Exception as exc:
@@ -182,11 +232,18 @@ def main():
     print(f"Starting Raspberry exporter for {DEVICE_NAME}")
     while True:
         try:
+            camera_defaults = fetch_device_config()
             telemetry = build_telemetry()
             result = post_telemetry(telemetry)
             print("Telemetry sent:", result)
             try:
-                snapshot = fetch_local_camera_snapshot()
+                scheduled = schedule_due_recurring_jobs()
+                if scheduled:
+                    print("Recurring jobs scheduled:", len(scheduled))
+            except Exception as exc:
+                print("Recurring schedule error:", exc)
+            try:
+                snapshot = fetch_local_camera_snapshot(camera_defaults)
                 camera_result = post_camera_snapshot(snapshot)
                 if camera_result:
                     print("Camera snapshot uploaded:", camera_result)
@@ -199,7 +256,7 @@ def main():
             print("Exporter error:", exc)
 
         try:
-            process_commands()
+            process_commands(camera_defaults)
         except Exception as exc:
             print("Command processing error:", exc)
 

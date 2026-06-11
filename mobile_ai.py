@@ -12,6 +12,9 @@ from agno.media import Image
 from agno.models.openai import OpenAIResponses
 from pydantic import BaseModel, Field
 
+import psycopg2
+import psycopg2.extras
+
 from iotca_store import ASSISTANT_ALLOWED_COMMANDS, db_session, get_measurement_window, queue_command
 
 
@@ -53,7 +56,11 @@ def _format_metric_value(metric: str, value: Any) -> str:
     return str(value)
 
 
-def build_mobile_context_text(window_summary: dict[str, Any], latest_rows: list[dict[str, Any]]) -> str:
+def build_mobile_context_text(
+    window_summary: dict[str, Any],
+    latest_rows: list[dict[str, Any]],
+    recurring_jobs: list[dict[str, Any]] | None = None,
+) -> str:
     lines = [
         "Greenhouse context:",
         "Temperature is in Celsius.",
@@ -85,10 +92,31 @@ def build_mobile_context_text(window_summary: dict[str, Any], latest_rows: list[
                 f"- {row.get('metric')}: {_format_metric_value(row.get('metric', ''), row.get('value'))} at {row.get('recorded_at')}"
             )
 
+    recurring_jobs = recurring_jobs or []
+    if recurring_jobs:
+        lines.append("")
+        lines.append("Scheduled jobs:")
+        for job in recurring_jobs[:10]:
+            status = "active" if job.get("active") else "paused"
+            next_run = job.get("next_run_at") or "unknown"
+            last_run = job.get("last_run_at") or "never"
+            lines.append(
+                f"- #{job.get('id')} {job.get('job_name')} -> {job.get('command')} every {job.get('interval_seconds')}s "
+                f"({status}, next {next_run}, last {last_run})"
+            )
+
     return "\n".join(lines)
 
 
 def build_mobile_agent(database_url: str, device_name: str) -> Agent:
+    def load_device(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, device_name, metadata FROM devices WHERE device_name = %s", (device_name,))
+            return cur.fetchone()
+
+    def _rows_as_dicts(rows):
+        return [dict(row) for row in rows]
+
     def query_history(metric: str | None = None, minutes: int = 60, limit: int | None = None):
         """Query older measurement history for the selected device."""
 
@@ -123,6 +151,94 @@ def build_mobile_agent(database_url: str, device_name: str) -> Agent:
                 "parameters": row["parameters"],
             }
 
+    def query_recurring_jobs(limit: int = 25):
+        """Read recurring jobs for the selected device."""
+
+        with db_session(database_url) as conn:
+            device = load_device(conn)
+            if not device:
+                return {"status": "error", "message": "Device not found"}
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+                    FROM recurring_jobs
+                    WHERE device_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (device["id"], max(1, min(int(limit), 100))),
+                )
+                rows = cur.fetchall()
+            return {"device_name": device_name, "rows": _rows_as_dicts(rows)}
+
+    def create_recurring_job(
+        job_name: str,
+        command: str,
+        interval_seconds: int,
+        state: str = "on",
+        duration_seconds: int | None = None,
+        active: bool = True,
+    ):
+        """Create a recurring job for the selected device."""
+
+        if command not in ASSISTANT_ALLOWED_COMMANDS:
+            return {"status": "error", "message": "That actuator is disabled in the assistant."}
+        parameters: dict[str, Any] = {"state": state}
+        if duration_seconds is not None:
+            parameters["duration_seconds"] = max(1, int(duration_seconds))
+
+        with db_session(database_url) as conn:
+            device = load_device(conn)
+            if not device:
+                return {"status": "error", "message": "Device not found"}
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO recurring_jobs (
+                        device_id, job_name, command, parameters, interval_seconds, active, next_run_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() ELSE now() + (%s || ' seconds')::interval END, now())
+                    RETURNING id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+                    """,
+                    (
+                        device["id"],
+                        job_name,
+                        command,
+                        psycopg2.extras.Json(parameters),
+                        max(1, int(interval_seconds)),
+                        active,
+                        active,
+                        max(1, int(interval_seconds)),
+                    ),
+                )
+                row = cur.fetchone()
+            return {"status": "created", "job": dict(row) if row else None}
+
+    def toggle_recurring_job(job_id: int, active: bool):
+        """Enable or pause an existing recurring job."""
+
+        with db_session(database_url) as conn:
+            device = load_device(conn)
+            if not device:
+                return {"status": "error", "message": "Device not found"}
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE recurring_jobs
+                    SET active = %s,
+                        next_run_at = CASE WHEN %s THEN now() ELSE next_run_at END,
+                        updated_at = now()
+                    WHERE id = %s AND device_id = %s
+                    RETURNING id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+                    """,
+                    (active, active, int(job_id), device["id"]),
+                )
+                row = cur.fetchone()
+            if not row:
+                return {"status": "error", "message": "Recurring job not found"}
+            return {"status": "ok", "job": dict(row)}
+
     description = (
         "You are a greenhouse assistant for a Raspberry Pi sensor node. "
         "The device reports temperature in Celsius, humidity as a percentage, and light on a reversed 0-255 raw scale "
@@ -136,6 +252,7 @@ def build_mobile_agent(database_url: str, device_name: str) -> Agent:
         "When acting, only use pump or cooler commands. Never try to control a heater.",
         "When analyzing an image, focus on visible plant health, moisture clues, discoloration, drooping, stress, and trends in the measurements.",
         "Remember that light is inverted: higher raw values mean darker conditions.",
+        "You can inspect recurring jobs and create or pause them when asked.",
     ]
 
     return Agent(
@@ -144,7 +261,7 @@ def build_mobile_agent(database_url: str, device_name: str) -> Agent:
         name="mobile-greenhouse-assistant",
         description=description,
         instructions=instructions,
-        tools=[query_history, queue_actuator],
+        tools=[query_history, queue_actuator, query_recurring_jobs, create_recurring_job, toggle_recurring_job],
         tool_call_limit=4,
         markdown=False,
         add_datetime_to_context=True,
@@ -226,7 +343,7 @@ async def run_chat(
     agent = build_mobile_agent(database_url=database_url, device_name=device_name)
     prompt = "\n\n".join(
         [
-            build_mobile_context_text(window_summary, latest_rows),
+            build_mobile_context_text(window_summary, latest_rows, window_summary.get("recurring_jobs") or []),
             "User message:",
             message.strip(),
         ]
@@ -256,7 +373,7 @@ async def run_analysis(
         [
             "Perform a plant health analysis for the greenhouse.",
             "Return structured output only.",
-            build_mobile_context_text(window_summary, latest_rows),
+            build_mobile_context_text(window_summary, latest_rows, window_summary.get("recurring_jobs") or []),
             "User request:",
             message.strip() or "Analyze the plant health, image, and the recent measurement window.",
         ]

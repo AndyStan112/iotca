@@ -7,7 +7,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from dotenv import load_dotenv
 
@@ -25,7 +25,14 @@ if not PI_TOKEN:
 
 app = FastAPI(title="Raspberry Pi Mini Server")
 
-URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "2")  # Schimbă cu hub-ul tău (1 sau 2)
+URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "3")  # Hub-ul pompei; default 3.
+
+subprocess.run(
+    ["sudo", "uhubctl", "-l", URMARESTE_HUB_USB, "-a", "0"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    check=False,
+)
 
 import board
 import adafruit_dht
@@ -300,7 +307,8 @@ async def control(request: Request):
 async def get_image(request: Request):
     """Face o poză în timp real și o trimite direct către client."""
     require_pi_token(request)
-    capture_camera_image(CAMERA_PATH)
+    params = parse_camera_params(request)
+    capture_camera_image(CAMERA_PATH, **params)
     return FileResponse(CAMERA_PATH, media_type="image/jpeg")
 
 
@@ -328,339 +336,6 @@ async def test_camera(request: Request):
         if os.path.exists(temp_path):
             os.unlink(temp_path)
         raise
-
-
-@app.get("/test_camera_ui")
-@app.get("/test_Camera_ui")
-async def test_camera_ui():
-    return HTMLResponse(
-        """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Pi Camera Test</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #07111f;
-      --panel: rgba(11, 21, 38, 0.92);
-      --panel-2: rgba(16, 30, 52, 0.95);
-      --text: #e8eef9;
-      --muted: #8ea4c9;
-      --accent: #6ee7b7;
-      --border: rgba(148, 163, 184, 0.18);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at top left, rgba(110, 231, 183, 0.14), transparent 28%),
-        linear-gradient(180deg, #040816, var(--bg));
-    }
-    .wrap {
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 24px 16px 40px;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 24px;
-      padding: 18px;
-      backdrop-filter: blur(14px);
-      box-shadow: 0 18px 60px rgba(0,0,0,0.28);
-      margin-bottom: 16px;
-    }
-    h1, h2, p { margin: 0; }
-    h1 { font-size: clamp(2rem, 4vw, 3rem); letter-spacing: -0.04em; }
-    .muted { color: var(--muted); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-    }
-    .row {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-    label {
-      display: block;
-      font-size: 0.88rem;
-      color: var(--muted);
-      margin-bottom: 8px;
-    }
-    input, select, button {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: var(--panel-2);
-      color: var(--text);
-      padding: 11px 12px;
-      font: inherit;
-    }
-    button {
-      cursor: pointer;
-      font-weight: 700;
-    }
-    .actions {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .actions button {
-      width: auto;
-      padding-inline: 16px;
-    }
-    .primary {
-      background: linear-gradient(135deg, #22c55e, #0ea5e9);
-      border: none;
-      color: #04111b;
-    }
-    .camera-shell {
-      position: relative;
-      border-radius: 20px;
-      overflow: hidden;
-      background: rgba(0,0,0,0.2);
-      border: 1px solid var(--border);
-      min-height: 320px;
-    }
-    img {
-      width: 100%;
-      height: 100%;
-      min-height: 320px;
-      display: block;
-      object-fit: cover;
-      background: rgba(0,0,0,0.12);
-    }
-    .status {
-      margin-top: 10px;
-      font-size: 0.92rem;
-      color: var(--muted);
-    }
-    .small {
-      font-size: 0.84rem;
-      color: var(--muted);
-    }
-    .stack {
-      display: grid;
-      gap: 14px;
-    }
-    .preset-row {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .preset-row button {
-      width: auto;
-    }
-    @media (max-width: 900px) {
-      .grid, .row { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card stack">
-      <div>
-        <h1>Camera Test</h1>
-        <p class="muted">Use this page to tune color, brightness, and exposure on the Pi camera.</p>
-      </div>
-      <div>
-        <label for="token">PI token</label>
-        <input id="token" placeholder="Paste PI_TOKEN here" />
-      </div>
-      <div class="actions">
-        <button class="primary" onclick="saveToken()">Save token</button>
-        <button onclick="loadImage()">Capture now</button>
-        <button onclick="startLive()">Start live refresh</button>
-        <button onclick="stopLive()">Stop live refresh</button>
-      </div>
-      <div class="small" id="status">Idle</div>
-    </div>
-
-    <div class="card stack">
-      <h2>Presets</h2>
-      <div class="preset-row">
-        <button onclick="applyPreset('default')">Default</button>
-        <button onclick="applyPreset('bright')">Bright</button>
-        <button onclick="applyPreset('dark')">Dark</button>
-        <button onclick="applyPreset('warm')">Warm</button>
-        <button onclick="applyPreset('cool')">Cool</button>
-        <button onclick="applyPreset('indoor')">Indoor</button>
-        <button onclick="applyPreset('plant')">Plant</button>
-      </div>
-    </div>
-
-    <div class="card stack">
-      <h2>Settings</h2>
-      <div class="grid">
-        <div>
-          <label for="preset">Preset</label>
-          <select id="preset">
-            <option value="default">default</option>
-            <option value="bright">bright</option>
-            <option value="dark">dark</option>
-            <option value="warm">warm</option>
-            <option value="cool">cool</option>
-            <option value="indoor">indoor</option>
-            <option value="plant">plant</option>
-          </select>
-        </div>
-        <div>
-          <label for="awb">AWB</label>
-          <input id="awb" placeholder="auto, incandescent, fluorescent..." />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label for="brightness">Brightness</label>
-          <input id="brightness" type="number" step="0.01" placeholder="0.0" />
-        </div>
-        <div>
-          <label for="contrast">Contrast</label>
-          <input id="contrast" type="number" step="0.01" placeholder="0.0" />
-        </div>
-        <div>
-          <label for="saturation">Saturation</label>
-          <input id="saturation" type="number" step="0.01" placeholder="0.0" />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label for="sharpness">Sharpness</label>
-          <input id="sharpness" type="number" step="0.01" placeholder="0.0" />
-        </div>
-        <div>
-          <label for="ev">EV</label>
-          <input id="ev" type="number" step="1" placeholder="0" />
-        </div>
-        <div>
-          <label for="gain">Gain</label>
-          <input id="gain" type="number" step="0.01" placeholder="0.0" />
-        </div>
-      </div>
-      <div class="grid">
-        <div>
-          <label for="exposure">Exposure</label>
-          <input id="exposure" placeholder="normal, auto, night..." />
-        </div>
-        <div>
-          <label for="metering">Metering</label>
-          <input id="metering" placeholder="average, spot..." />
-        </div>
-      </div>
-      <div>
-        <label for="shutter">Shutter</label>
-        <input id="shutter" type="number" step="1" placeholder="microseconds" />
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="camera-shell">
-        <img id="preview" alt="Camera preview" />
-      </div>
-      <div class="status" id="capture-status">No capture yet</div>
-    </div>
-  </div>
-
-  <script>
-    let timer = null;
-
-    function saveToken() {
-      localStorage.setItem('pi-token', document.getElementById('token').value.trim());
-      setStatus('Token saved');
-    }
-
-    function loadToken() {
-      const token = localStorage.getItem('pi-token') || '';
-      document.getElementById('token').value = token;
-      return token;
-    }
-
-    function setStatus(text) {
-      document.getElementById('status').textContent = text;
-    }
-
-    function setCaptureStatus(text) {
-      document.getElementById('capture-status').textContent = text;
-    }
-
-    function buildUrl() {
-      const params = new URLSearchParams();
-      const fields = ['preset', 'brightness', 'contrast', 'saturation', 'sharpness', 'exposure', 'awb', 'metering', 'ev', 'shutter', 'gain'];
-      for (const name of fields) {
-        const value = document.getElementById(name).value.trim();
-        if (value) params.set(name, value);
-      }
-      const token = loadToken();
-      if (!token) {
-        throw new Error('Missing PI token');
-      }
-      return `/test_camera?${params.toString()}`;
-    }
-
-    async function loadImage() {
-      try {
-        setStatus('Capturing...');
-        const token = loadToken();
-        if (!token) {
-          setCaptureStatus('Paste PI token first.');
-          setStatus('Missing token');
-          return;
-        }
-        const url = buildUrl();
-        const response = await fetch(url, {
-          headers: { Authorization: `Bearer ${token}` },
-          cache: 'no-store',
-        });
-        if (!response.ok) {
-          const text = await response.text();
-          throw new Error(text || response.statusText);
-        }
-        const blob = await response.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        const img = document.getElementById('preview');
-        img.onload = () => URL.revokeObjectURL(objectUrl);
-        img.src = objectUrl;
-        setStatus('Loaded');
-        setCaptureStatus(`Captured at ${new Date().toLocaleString()}`);
-      } catch (err) {
-        setStatus(`Error: ${err.message}`);
-        setCaptureStatus(`Error: ${err.message}`);
-      }
-    }
-
-    function startLive() {
-      stopLive();
-      loadImage();
-      timer = window.setInterval(loadImage, 2000);
-      setStatus('Live refresh running');
-    }
-
-    function stopLive() {
-      if (timer) window.clearInterval(timer);
-      timer = null;
-      setStatus('Live refresh stopped');
-    }
-
-    function applyPreset(name) {
-      document.getElementById('preset').value = name;
-      loadImage();
-    }
-
-    document.getElementById('token').value = loadToken();
-  </script>
-</body>
-</html>
-        """,
-        media_type="text/html",
-    )
 
 
 @app.get("/")

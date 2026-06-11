@@ -16,7 +16,7 @@ import psycopg2.extras
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse, RedirectResponse
 
 from iotca_store import get_recent_measurements as store_get_recent_measurements
 from iotca_store import load_device_by_name as store_load_device_by_name
@@ -148,6 +148,29 @@ def load_device_by_name(conn, device_name: str):
         return cur.fetchone()
 
 
+def update_device_metadata(conn, device_name: str, metadata: dict[str, Any]):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE devices
+            SET metadata = %s
+            WHERE device_name = %s
+            RETURNING id, device_name, device_key, metadata
+            """,
+            (psycopg2.extras.Json(metadata), device_name),
+        )
+        return cur.fetchone()
+
+
+def camera_defaults_from_metadata(metadata: dict[str, Any] | None):
+    defaults = {}
+    if isinstance(metadata, dict):
+        raw_defaults = metadata.get("camera_defaults")
+        if isinstance(raw_defaults, dict):
+            defaults.update(raw_defaults)
+    return defaults
+
+
 def ensure_device_for_device_token(conn, device_name: str, device_token: str, metadata: dict[str, Any] | None = None):
     if device_name not in ALLOWED_DEVICE_NAMES:
         raise HTTPException(status_code=403, detail="Device not allowed")
@@ -251,6 +274,135 @@ def get_recent_commands(conn, device_id: int, limit: int = 25):
         return cur.fetchall()
 
 
+def cancel_command(conn, command_id: int, device_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE commands
+            SET status = 'canceled',
+                result = %s
+            WHERE id = %s AND device_id = %s AND status = 'pending'
+            RETURNING id, command, parameters, status, created_at, sent_at, acknowledged_at, result
+            """,
+            (psycopg2.extras.Json({"canceled": True}), command_id, device_id),
+        )
+        return cur.fetchone()
+
+
+def get_recurring_jobs(conn, device_id: int, limit: int = 100):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+            FROM recurring_jobs
+            WHERE device_id = %s
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            (device_id, limit),
+        )
+        return cur.fetchall()
+
+
+def insert_command(conn, device_id: int, command: str, parameters: dict[str, Any]):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO commands (device_id, command, parameters, status)
+            VALUES (%s, %s, %s, 'pending')
+            RETURNING id, created_at
+            """,
+            (device_id, command, psycopg2.extras.Json(parameters)),
+        )
+        return cur.fetchone()
+
+
+def create_recurring_job(conn, device_id: int, job_name: str, command: str, parameters: dict[str, Any], interval_seconds: int, active: bool = True):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO recurring_jobs (
+                device_id, job_name, command, parameters, interval_seconds, active, next_run_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() ELSE now() + (%s || ' seconds')::interval END, now())
+            RETURNING id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+            """,
+            (
+                device_id,
+                job_name,
+                command,
+                psycopg2.extras.Json(parameters),
+                interval_seconds,
+                active,
+                active,
+                interval_seconds,
+            ),
+        )
+        return cur.fetchone()
+
+
+def update_recurring_job_active(conn, job_id: int, device_id: int, active: bool):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE recurring_jobs
+            SET active = %s,
+                next_run_at = CASE WHEN %s THEN now() ELSE next_run_at END,
+                updated_at = now()
+            WHERE id = %s AND device_id = %s
+            RETURNING id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+            """,
+            (active, active, job_id, device_id),
+        )
+        return cur.fetchone()
+
+
+def schedule_due_recurring_jobs(conn, device_id: int, limit: int = 20):
+    scheduled = []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, job_name, command, parameters, interval_seconds, next_run_at
+            FROM recurring_jobs
+            WHERE device_id = %s AND active = TRUE AND next_run_at <= now()
+            ORDER BY next_run_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (device_id, limit),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO commands (device_id, command, parameters, status)
+                VALUES (%s, %s, %s, 'pending')
+                RETURNING id, created_at
+                """,
+                (device_id, row["command"], row["parameters"]),
+            )
+            command_row = cur.fetchone()
+            cur.execute(
+                """
+                UPDATE recurring_jobs
+                SET last_run_at = now(),
+                    next_run_at = now() + make_interval(secs => interval_seconds),
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING id, job_name, command, parameters, interval_seconds, active, next_run_at, last_run_at, created_at, updated_at
+                """,
+                (row["id"],),
+            )
+            job_row = cur.fetchone()
+            scheduled.append(
+                {
+                    "job": job_row,
+                    "command": command_row,
+                }
+            )
+    return scheduled
+
+
 def get_pending_commands(conn, device_id: int, limit: int = 25):
     with conn.cursor() as cur:
         cur.execute(
@@ -305,12 +457,14 @@ def load_mobile_ai_context(window_points: int):
             raise HTTPException(status_code=404, detail="Device not found")
         recent_rows = store_get_recent_measurements(conn, MOBILE_DEVICE_NAME, limit=500)
         summary = summarize_recent_measurements(recent_rows, window_points=window_points)
+        recurring_jobs = get_recurring_jobs(conn, device["id"], limit=100)
 
     return {
         "device_name": MOBILE_DEVICE_NAME,
         "window_points": window_points,
         "summary": summary,
         "latest_rows": recent_rows[-8:],
+        "recurring_jobs": recurring_jobs,
     }
 
 
@@ -346,6 +500,56 @@ async def list_devices(request: Request, _: bool = Depends(require_admin_session
             )
             rows = cur.fetchall()
     return JSONResponse(jsonable_encoder({"devices": rows}))
+
+
+@app.get("/api/device/config")
+async def device_config(request: Request, device_name: str):
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        device_token = get_request_token(request)
+        if not is_session_valid(device_token):
+            if not device_token or device.get("device_key") != device_token:
+                raise HTTPException(status_code=401, detail="Authentication required")
+    metadata = device.get("metadata") or {}
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "device_name": device_name,
+                "metadata": metadata,
+                "camera_defaults": camera_defaults_from_metadata(metadata),
+            }
+        )
+    )
+
+
+@app.post("/api/device/camera-defaults")
+async def set_device_camera_defaults(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    device_name = data.get("device_name")
+    defaults = data.get("camera_defaults")
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if not isinstance(defaults, dict):
+        raise HTTPException(status_code=400, detail="camera_defaults must be an object")
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        metadata = dict(device.get("metadata") or {})
+        metadata["camera_defaults"] = defaults
+        device = update_device_metadata(conn, device_name, metadata)
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "status": "ok",
+                "device_name": device_name,
+                "metadata": device.get("metadata") if device else metadata,
+                "camera_defaults": defaults,
+            }
+        )
+    )
 
 
 @app.post("/api/telemetry")
@@ -492,6 +696,27 @@ async def list_commands(request: Request, device_name: str, limit: int = 25, _: 
     return JSONResponse(jsonable_encoder({"device_name": device_name, "rows": rows}))
 
 
+@app.post("/api/commands/cancel")
+async def cancel_pending_command(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    device_name = data.get("device_name")
+    command_id = data.get("command_id")
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if command_id is None:
+        raise HTTPException(status_code=400, detail="command_id is required")
+
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        row = cancel_command(conn, int(command_id), device["id"])
+
+    if not row:
+        raise HTTPException(status_code=409, detail="Command is no longer pending")
+    return JSONResponse(jsonable_encoder({"status": "ok", "command": row}))
+
+
 @app.post("/api/commands/claim")
 async def claim_commands(request: Request):
     data = await request.json()
@@ -580,6 +805,93 @@ async def create_command(request: Request, _: bool = Depends(require_admin_sessi
         conn.close()
 
     return JSONResponse(jsonable_encoder({"status": "ok", "command_id": command_row["id"], "command": command}))
+
+
+@app.get("/api/recurring-jobs")
+async def list_recurring_jobs(request: Request, device_name: str, _: bool = Depends(require_admin_session)):
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        rows = get_recurring_jobs(conn, device["id"], limit=100)
+    return JSONResponse(jsonable_encoder({"device_name": device_name, "rows": rows}))
+
+
+@app.post("/api/recurring-jobs")
+async def create_recurring_job_route(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    device_name = data.get("device_name")
+    job_name = str(data.get("job_name") or "").strip()
+    command = str(data.get("command") or "").strip()
+    parameters = data.get("parameters") or {}
+    interval_seconds = int(data.get("interval_seconds") or 0)
+    active = bool(data.get("active", True))
+
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if not job_name:
+        raise HTTPException(status_code=400, detail="job_name is required")
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    if not isinstance(parameters, dict):
+        raise HTTPException(status_code=400, detail="parameters must be an object")
+    if interval_seconds <= 0:
+        raise HTTPException(status_code=400, detail="interval_seconds must be greater than zero")
+
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        row = create_recurring_job(conn, device["id"], job_name, command, parameters, interval_seconds, active=active)
+
+    return JSONResponse(jsonable_encoder({"status": "ok", "job": row}))
+
+
+@app.post("/api/recurring-jobs/toggle")
+async def toggle_recurring_job(request: Request, _: bool = Depends(require_admin_session)):
+    data = await request.json()
+    device_name = data.get("device_name")
+    job_id = data.get("job_id")
+    active = data.get("active")
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if job_id is None:
+        raise HTTPException(status_code=400, detail="job_id is required")
+    if active is None:
+        raise HTTPException(status_code=400, detail="active is required")
+
+    with db_session() as conn:
+        device = load_device_by_name(conn, device_name)
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        row = update_recurring_job_active(conn, int(job_id), device["id"], bool(active))
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Recurring job not found")
+    return JSONResponse(jsonable_encoder({"status": "ok", "job": row}))
+
+
+@app.post("/api/recurring-jobs/run-due")
+async def run_due_recurring_jobs(request: Request):
+    data = await request.json()
+    device_name = data.get("device_name")
+    device_token = get_request_token(request)
+    limit = int(data.get("limit") or 20)
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if not device_token:
+        raise HTTPException(status_code=401, detail="Missing device token")
+
+    with db_session() as conn:
+        device = require_device_for_name(conn, device_name, device_token)
+        scheduled = schedule_due_recurring_jobs(conn, device["id"], limit=max(1, min(limit, 50)))
+
+    return JSONResponse(jsonable_encoder({"status": "ok", "device_name": device_name, "scheduled": scheduled}))
+
+
+@app.get("/camera-test")
+async def camera_test():
+    return RedirectResponse(url="/#camera-calibration", status_code=307)
 
 
 @app.get("/api/mobile/context")
@@ -697,6 +1009,18 @@ async def index():
     .stack { display: grid; gap: 12px; }
     .actions { display: flex; gap: 12px; flex-wrap: wrap; }
     .actions button { width: auto; padding-inline: 16px; cursor: pointer; }
+    .action-link {
+      width: auto;
+      padding: 12px 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(148, 163, 184, 0.12);
+      color: var(--text);
+    }
     .primary { background: linear-gradient(135deg, #22c55e, #0ea5e9); border: none; color: #04111b; font-weight: 700; }
     .ghost { background: rgba(148, 163, 184, 0.12); }
     .danger { background: rgba(248, 113, 113, 0.16); border-color: rgba(248, 113, 113, 0.32); }
@@ -786,7 +1110,7 @@ async def index():
           <div class="row">
             <div>
               <label for="device-select">Select device</label>
-              <select id="device-select" onchange="refreshAll()"></select>
+              <select id="device-select" onchange="onDeviceChange()"></select>
             </div>
             <div>
               <label for="metric-filter">Metric filter</label>
@@ -869,6 +1193,154 @@ async def index():
         </div>
         <div id="camera-status" class="muted" style="margin-top:10px;">Photo mode</div>
       </section>
+
+      <section id="camera-calibration" class="card" style="margin-top:16px;">
+        <div class="hero" style="margin-bottom:12px;">
+          <div>
+            <h2>Camera calibration</h2>
+            <p class="subtitle">Save the defaults here, then queue a capture command. The Pi worker will use the DB-backed profile on its next pass.</p>
+          </div>
+          <div class="actions">
+            <button class="ghost" onclick="saveCameraDefaults()">Save defaults</button>
+            <button class="primary" onclick="queueCameraCapture()">Capture test</button>
+            <a class="action-link" href="/camera-test">Open test endpoint</a>
+          </div>
+        </div>
+        <div class="split">
+          <div class="stack">
+            <div class="row">
+              <div>
+                <label for="camera-preset">Preset</label>
+                <select id="camera-preset">
+                  <option value="default">default</option>
+                  <option value="bright">bright</option>
+                  <option value="dark">dark</option>
+                  <option value="warm">warm</option>
+                  <option value="cool">cool</option>
+                  <option value="indoor">indoor</option>
+                  <option value="plant">plant</option>
+                </select>
+              </div>
+              <div>
+                <label for="camera-awb">AWB</label>
+                <input id="camera-awb" placeholder="auto, incandescent, fluorescent..." />
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label for="camera-brightness">Brightness</label>
+                <input id="camera-brightness" type="number" step="0.01" placeholder="0.0" />
+              </div>
+              <div>
+                <label for="camera-contrast">Contrast</label>
+                <input id="camera-contrast" type="number" step="0.01" placeholder="0.0" />
+              </div>
+              <div>
+                <label for="camera-saturation">Saturation</label>
+                <input id="camera-saturation" type="number" step="0.01" placeholder="0.0" />
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label for="camera-sharpness">Sharpness</label>
+                <input id="camera-sharpness" type="number" step="0.01" placeholder="0.0" />
+              </div>
+              <div>
+                <label for="camera-ev">EV</label>
+                <input id="camera-ev" type="number" step="1" placeholder="0" />
+              </div>
+              <div>
+                <label for="camera-gain">Gain</label>
+                <input id="camera-gain" type="number" step="0.01" placeholder="0.0" />
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label for="camera-exposure">Exposure</label>
+                <input id="camera-exposure" placeholder="normal, auto, night..." />
+              </div>
+              <div>
+                <label for="camera-metering">Metering</label>
+                <input id="camera-metering" placeholder="average, spot..." />
+              </div>
+              <div>
+                <label for="camera-shutter">Shutter</label>
+                <input id="camera-shutter" type="number" step="1" placeholder="microseconds" />
+              </div>
+            </div>
+          </div>
+          <div class="stack">
+            <div class="camera-shell">
+              <img id="camera-test-feed" class="camera-image" alt="Camera calibration preview" />
+              <div id="camera-test-placeholder" class="camera-placeholder">No calibration capture yet</div>
+            </div>
+            <div id="camera-test-status" class="muted">Calibration idle</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="recurring-jobs" class="card" style="margin-top:16px;">
+        <div class="hero" style="margin-bottom:12px;">
+          <div>
+            <h2>Recurring jobs</h2>
+            <p class="subtitle">Create a repeating command like watering every 30 seconds, then start or stop it without deleting the schedule.</p>
+          </div>
+          <div class="actions">
+            <button class="ghost" onclick="loadRecurringJobs()">Refresh jobs</button>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="row">
+            <div>
+              <label for="job-name">Job name</label>
+              <input id="job-name" placeholder="Watering cycle" />
+            </div>
+            <div>
+              <label for="job-command">Command</label>
+              <select id="job-command">
+                <option value="pompa">Pump</option>
+                <option value="incalzire">Heat</option>
+                <option value="racire">Cool</option>
+              </select>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="job-state">State</label>
+              <select id="job-state">
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div>
+              <label for="job-duration">Duration seconds</label>
+              <input id="job-duration" type="number" min="1" step="1" placeholder="1" />
+            </div>
+            <div>
+              <label for="job-interval">Interval seconds</label>
+              <input id="job-interval" type="number" min="1" step="1" placeholder="30" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="job-extra">Extra JSON</label>
+              <input id="job-extra" placeholder='{"notes":"optional"}' />
+            </div>
+            <div>
+              <label for="job-active">Active on create</label>
+              <select id="job-active">
+                <option value="true" selected>Yes</option>
+                <option value="false">No</option>
+              </select>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="primary" onclick="createRecurringJob()">Create recurring job</button>
+          </div>
+          <div id="jobs-result" class="muted"></div>
+          <div id="jobs-list" class="list"></div>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -876,6 +1348,8 @@ async def index():
   let refreshInterval = null;
   let debounceHandle = null;
   let cameraLiveTimer = null;
+  let deviceMetadataByName = {};
+  let recurringJobsById = {};
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -960,6 +1434,13 @@ async def index():
     console.error(err);
   }
 
+  async function onDeviceChange() {
+    const deviceName = currentDeviceName();
+    populateCameraDefaults(deviceName);
+    await refreshAll().catch(handleRefreshError);
+    await refreshCamera().catch(handleRefreshError);
+  }
+
   function currentDeviceName() {
     const select = document.getElementById('device-select');
     return select && select.value ? select.value : 'greenhouse-01';
@@ -1003,17 +1484,236 @@ async def index():
     if (button) button.textContent = 'Stop live feed';
   }
 
+  async function queueCameraCapture() {
+    const img = document.getElementById('camera-test-feed');
+    const placeholder = document.getElementById('camera-test-placeholder');
+    const status = document.getElementById('camera-test-status');
+    const deviceName = currentDeviceName();
+    if (status) status.textContent = 'Queueing calibration capture...';
+    try {
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({
+          device_name: deviceName,
+          command: 'camera_capture',
+          parameters: {},
+        }),
+      });
+      if (status) status.textContent = 'Calibration capture queued';
+      if (placeholder) placeholder.style.display = 'grid';
+      window.setTimeout(() => {
+        if (img) {
+          img.onload = () => {
+            if (placeholder) placeholder.style.display = 'none';
+            if (status) status.textContent = 'Calibration capture loaded';
+          };
+          img.onerror = () => {
+            if (placeholder) placeholder.style.display = 'grid';
+            if (status) status.textContent = 'Calibration capture failed';
+          };
+          img.src = `/api/camera/latest?device_name=${encodeURIComponent(deviceName)}&t=${Date.now()}`;
+        }
+      }, 7000);
+    } catch (err) {
+      if (status) status.textContent = err.message;
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+      }
+    }
+  }
+
+  async function saveCameraDefaults() {
+    const deviceName = currentDeviceName();
+    const cameraDefaults = currentCameraDefaults();
+    try {
+      const result = await api('/api/device/camera-defaults', {
+        method: 'POST',
+        body: JSON.stringify({ device_name: deviceName, camera_defaults: cameraDefaults }),
+      });
+      deviceMetadataByName[deviceName] = result.metadata || {};
+      const status = document.getElementById('camera-test-status');
+      if (status) status.textContent = 'Saved as default camera profile';
+    } catch (err) {
+      const status = document.getElementById('camera-test-status');
+      if (status) status.textContent = err.message;
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+      }
+    }
+  }
+
   async function loadDevices() {
     const data = await api('/api/devices', { method: 'GET' });
     const select = document.getElementById('device-select');
     select.innerHTML = '';
+    deviceMetadataByName = {};
     for (const device of data.devices) {
       const option = document.createElement('option');
       option.value = device.device_name;
       option.textContent = device.device_name;
       select.appendChild(option);
+      deviceMetadataByName[device.device_name] = device.metadata || {};
     }
     if (!select.value && select.options.length) select.value = select.options[0].value;
+    populateCameraDefaults(select.value);
+  }
+
+  async function loadRecurringJobs() {
+    const deviceName = currentDeviceName();
+    if (!deviceName) return;
+    const data = await api(`/api/recurring-jobs?device_name=${encodeURIComponent(deviceName)}`, { method: 'GET' });
+    renderRecurringJobs(data.rows || []);
+  }
+
+  function renderRecurringJobs(rows) {
+    const list = document.getElementById('jobs-list');
+    recurringJobsById = {};
+    if (!list) return;
+    if (!rows.length) {
+      list.innerHTML = '<div class="muted">No recurring jobs yet.</div>';
+      return;
+    }
+    list.innerHTML = rows.map(row => {
+      recurringJobsById[row.id] = row;
+      const nextRun = row.next_run_at ? `Next: ${row.next_run_at}` : 'Next: --';
+      const lastRun = row.last_run_at ? `Last: ${row.last_run_at}` : 'Last: --';
+      const buttonLabel = row.active ? 'Stop' : 'Start';
+      return `
+        <div class="pill">${row.job_name} · ${row.command} · every ${row.interval_seconds}s · ${row.active ? 'active' : 'paused'}</div>
+        <pre>${JSON.stringify(row, null, 2)}</pre>
+        <div class="actions">
+          <button class="ghost" onclick="toggleRecurringJob(${row.id}, ${row.active ? 'false' : 'true'})">${buttonLabel}</button>
+        </div>
+        <div class="muted">${nextRun} · ${lastRun}</div>
+      `;
+    }).join('');
+  }
+
+  async function createRecurringJob() {
+    const deviceName = currentDeviceName();
+    const jobName = document.getElementById('job-name').value.trim();
+    const command = document.getElementById('job-command').value;
+    const state = document.getElementById('job-state').value;
+    const durationRaw = document.getElementById('job-duration').value.trim();
+    const intervalRaw = document.getElementById('job-interval').value.trim();
+    const extraRaw = document.getElementById('job-extra').value.trim();
+    const active = document.getElementById('job-active').value === 'true';
+
+    if (!jobName) {
+      document.getElementById('jobs-result').textContent = 'Job name is required.';
+      return;
+    }
+
+    const intervalSeconds = Number.parseInt(intervalRaw, 10);
+    if (!Number.isInteger(intervalSeconds) || intervalSeconds <= 0) {
+      document.getElementById('jobs-result').textContent = 'Interval seconds must be a positive integer.';
+      return;
+    }
+
+    let parameters = { state };
+    if (durationRaw) {
+      const durationSeconds = Number.parseInt(durationRaw, 10);
+      if (!Number.isInteger(durationSeconds) || durationSeconds <= 0) {
+        document.getElementById('jobs-result').textContent = 'Duration seconds must be a positive integer.';
+        return;
+      }
+      parameters.duration_seconds = durationSeconds;
+    }
+
+    if (extraRaw) {
+      try {
+        const extra = JSON.parse(extraRaw);
+        if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+          parameters = { ...parameters, ...extra };
+        } else {
+          document.getElementById('jobs-result').textContent = 'Extra JSON must be an object.';
+          return;
+        }
+      } catch (err) {
+        document.getElementById('jobs-result').textContent = 'Invalid extra JSON.';
+        return;
+      }
+    }
+
+    try {
+      const result = await api('/api/recurring-jobs', {
+        method: 'POST',
+        body: JSON.stringify({
+          device_name: deviceName,
+          job_name: jobName,
+          command,
+          parameters,
+          interval_seconds: intervalSeconds,
+          active,
+        }),
+      });
+      document.getElementById('jobs-result').textContent = `Created recurring job ${result.job.id}.`;
+      await loadRecurringJobs();
+    } catch (err) {
+      document.getElementById('jobs-result').textContent = err.message;
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+      }
+    }
+  }
+
+  async function toggleRecurringJob(jobId, active) {
+    const deviceName = currentDeviceName();
+    try {
+      const result = await api('/api/recurring-jobs/toggle', {
+        method: 'POST',
+        body: JSON.stringify({ device_name: deviceName, job_id: jobId, active }),
+      });
+      recurringJobsById[jobId] = result.job || recurringJobsById[jobId];
+      await loadRecurringJobs();
+    } catch (err) {
+      document.getElementById('jobs-result').textContent = err.message;
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+      }
+    }
+  }
+
+  function applyCameraDefaults(defaults = {}) {
+    const fields = {
+      'camera-preset': defaults.preset,
+      'camera-brightness': defaults.brightness,
+      'camera-contrast': defaults.contrast,
+      'camera-saturation': defaults.saturation,
+      'camera-sharpness': defaults.sharpness,
+      'camera-exposure': defaults.exposure,
+      'camera-awb': defaults.awb,
+      'camera-metering': defaults.metering,
+      'camera-ev': defaults.ev,
+      'camera-shutter': defaults.shutter,
+      'camera-gain': defaults.gain,
+    };
+    for (const [id, value] of Object.entries(fields)) {
+      const input = document.getElementById(id);
+      if (input) input.value = value ?? '';
+    }
+  }
+
+  function populateCameraDefaults(deviceName) {
+    if (!deviceName) return;
+    const metadata = deviceMetadataByName[deviceName] || {};
+    applyCameraDefaults(metadata.camera_defaults || {});
+  }
+
+  function currentCameraDefaults() {
+    return {
+      preset: document.getElementById('camera-preset').value.trim(),
+      brightness: document.getElementById('camera-brightness').value.trim(),
+      contrast: document.getElementById('camera-contrast').value.trim(),
+      saturation: document.getElementById('camera-saturation').value.trim(),
+      sharpness: document.getElementById('camera-sharpness').value.trim(),
+      exposure: document.getElementById('camera-exposure').value.trim(),
+      awb: document.getElementById('camera-awb').value.trim(),
+      metering: document.getElementById('camera-metering').value.trim(),
+      ev: document.getElementById('camera-ev').value.trim(),
+      shutter: document.getElementById('camera-shutter').value.trim(),
+      gain: document.getElementById('camera-gain').value.trim(),
+    };
   }
 
   async function refreshAll() {
@@ -1030,11 +1730,15 @@ async def index():
     const commands = await api(`/api/commands?device_name=${encodeURIComponent(deviceName)}&limit=10`, { method: 'GET' });
     renderCommands(commands.rows || []);
 
+    const recurringJobs = await api(`/api/recurring-jobs?device_name=${encodeURIComponent(deviceName)}`, { method: 'GET' });
+    renderRecurringJobs(recurringJobs.rows || []);
+
     document.getElementById('session-info').textContent = JSON.stringify({
       device_name: deviceName,
       metrics_returned: latest.rows?.length || 0,
       recent_rows: recent.rows?.length || 0,
       commands: commands.rows?.length || 0,
+      recurring_jobs: recurringJobs.rows?.length || 0,
     }, null, 2);
   }
 
@@ -1089,6 +1793,7 @@ async def index():
     list.innerHTML = rows.map(row => `
       <div class="pill">${row.command} · ${row.status}</div>
       <pre>${JSON.stringify(row, null, 2)}</pre>
+      ${row.status === 'pending' ? `<div class="actions"><button class="ghost" onclick="cancelCommand(${row.id})">Cancel command</button></div>` : ''}
     `).join('');
   }
 
@@ -1121,6 +1826,23 @@ async def index():
         return;
       }
       document.getElementById('command-result').textContent = err.message;
+    }
+  }
+
+  async function cancelCommand(commandId) {
+    const deviceName = document.getElementById('device-select').value;
+    try {
+      const result = await api('/api/commands/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ device_name: deviceName, command_id: commandId }),
+      });
+      document.getElementById('command-result').textContent = `Command ${result.command.id} canceled.`;
+      await refreshAll();
+    } catch (err) {
+      document.getElementById('command-result').textContent = err.message;
+      if (err.status === 401 || err.status === 403) {
+        showLogin('');
+      }
     }
   }
 
@@ -1629,6 +2351,17 @@ async def mobile():
         </div>
         <div id="camera-status" class="small" style="margin-top:10px;">Photo mode</div>
       </section>
+
+      <section class="card">
+        <div class="status-line" style="margin-bottom:12px;">
+          <div>
+            <h2>Scheduled jobs</h2>
+            <p class="small">Recurring jobs stored in Postgres, including watering cycles and other repeating commands.</p>
+          </div>
+          <div class="badge" id="jobs-status">Loading...</div>
+        </div>
+        <div id="mobile-job-list" class="spaced"></div>
+      </section>
     </main>
   </div>
 
@@ -1785,6 +2518,37 @@ async def mobile():
         <ul>${concerns.map(item => `<li>${escapeHtml(item)}</li>`).join('') || '<li>No concerns returned.</li>'}</ul>
       </div>
     `;
+  }
+
+  function renderRecurringJobs(rows) {
+    const target = document.getElementById('mobile-job-list');
+    const status = document.getElementById('jobs-status');
+    const jobs = Array.isArray(rows) ? rows : [];
+    if (status) status.textContent = jobs.length ? `${jobs.length} job${jobs.length === 1 ? '' : 's'}` : 'No jobs';
+    if (!target) return;
+    if (!jobs.length) {
+      target.innerHTML = '<div class="small">No scheduled jobs yet.</div>';
+      return;
+    }
+    target.innerHTML = jobs.map(job => {
+      const nextRun = job.next_run_at ? new Date(job.next_run_at).toLocaleString() : '--';
+      const lastRun = job.last_run_at ? new Date(job.last_run_at).toLocaleString() : '--';
+      const details = Object.entries(job.parameters || {}).map(([key, value]) => `${escapeHtml(key)}: ${escapeHtml(value)}`).join(', ');
+      return `
+        <div class="metric">
+          <div class="metric-title-row">
+            <div>
+              <h2>${escapeHtml(job.job_name)}</h2>
+              <div class="small">${escapeHtml(job.command)} · every ${job.interval_seconds}s</div>
+            </div>
+            <div class="badge">${job.active ? 'active' : 'paused'}</div>
+          </div>
+          <div class="small">Next run: ${escapeHtml(nextRun)}</div>
+          <div class="small">Last run: ${escapeHtml(lastRun)}</div>
+          <div class="small">Parameters: ${details || '--'}</div>
+        </div>
+      `;
+    }).join('');
   }
 
   async function sendChat() {
@@ -2261,14 +3025,16 @@ async def mobile():
 
   async function loadAndRender() {
     return preserveScroll(async () => {
-      const [latest, recent] = await Promise.all([
+      const [latest, recent, context] = await Promise.all([
         api(`/api/latest?device_name=${encodeURIComponent(DEVICE_NAME)}`, { method: 'GET' }),
         api(`/api/recent?device_name=${encodeURIComponent(DEVICE_NAME)}&limit=500`, { method: 'GET' }),
+        api(`/api/mobile/context?window_points=${encodeURIComponent(document.getElementById('window-size').value || 10)}`, { method: 'GET' }),
       ]);
       document.getElementById('device-name').textContent = DEVICE_NAME;
       seriesData = extractSeries(recent.rows || []);
       renderMetrics(recent.rows || []);
       renderCharts();
+      renderRecurringJobs(context.recurring_jobs || []);
 
       const latestRows = latest.rows || [];
       let newestTimestamp = null;

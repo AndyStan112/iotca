@@ -4,7 +4,7 @@ This project splits the system into three parts:
 
 - `pi_mini_server.py` runs on the Pi and owns the hardware.
 - `scripts/pi_exporter.py` runs on the Pi and periodically exports sensor state to the cloud database, then polls and executes pending commands.
-- `server.py` runs in the cloud and provides the password-gated UI plus command storage.
+- `server.py` runs in the cloud and provides the password-gated UI, camera calibration controls, plus command storage.
 
 The two Pi-side processes are intentional:
 
@@ -16,6 +16,10 @@ The database schema in `migrations/` is left unchanged.
 ## What talks to what
 
 - The Pi mini-server exposes `/api/status`, `/api/data`, `/api/control`, and `/api/camera`.
+- The Pi mini-server also exposes `/test_camera` for camera calibration captures, but it does not host a standalone UI anymore.
+- Camera calibration from the cloud UI works by saving defaults in the database and queuing a `camera_capture` command that the Pi exporter executes on its next poll.
+- Recurring jobs live in the cloud database, and the exporter turns due jobs into regular queued commands. You can start and stop them from the cloud UI without deleting the schedule.
+- Pending one-off commands can be canceled from the cloud UI before the exporter claims them.
 - The exporter polls the Pi mini-server locally, then posts telemetry to the cloud server.
 - The cloud server stores telemetry in `measurements` and command history in `commands`.
 - When you log in to the cloud UI, the backend stores commands in the database and the Pi pulls them on its next export cycle.
@@ -79,6 +83,14 @@ If you change dependencies later, update those files and run `uv sync` again.
 
 ```bash
 uv run python3 scripts/db_create_tables.py
+```
+
+Then apply any later migrations in order, including `migrations/003_create_recurring_jobs_table.sql`.
+
+To apply that third migration directly, run:
+
+```bash
+uv run python3 scripts/db_run_third_migration.py
 ```
 
 ## Run the cloud server
