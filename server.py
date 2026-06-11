@@ -1394,6 +1394,33 @@ async def mobile():
       border-radius: 18px;
       border: 1px solid var(--border);
     }
+    .chart-wrap {
+      position: relative;
+      width: 100%;
+    }
+    .chart-tooltip {
+      position: absolute;
+      pointer-events: none;
+      transform: translate(-50%, calc(-100% - 10px));
+      background: rgba(4, 10, 20, 0.96);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 12px;
+      padding: 8px 10px;
+      min-width: 120px;
+      color: var(--text);
+      font-size: 0.82rem;
+      box-shadow: 0 16px 32px rgba(0, 0, 0, 0.34);
+      z-index: 2;
+      display: none;
+    }
+    .chart-tooltip .label {
+      color: var(--muted);
+      font-size: 0.74rem;
+      margin-bottom: 4px;
+    }
+    .chart-tooltip .value {
+      font-weight: 700;
+    }
     .metric-title-row {
       display: flex;
       justify-content: space-between;
@@ -2036,7 +2063,7 @@ async def mobile():
     }
   }
 
-  function drawChart(canvas, points, color) {
+  function drawChart(canvas, points, metric) {
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
     const width = canvas.clientWidth;
@@ -2046,8 +2073,12 @@ async def mobile():
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, width, height);
 
-    ctx.fillStyle = 'rgba(255,255,255,0.03)';
-    ctx.fillRect(0, 0, width, height);
+    const paddingLeft = 54;
+    const paddingRight = 16;
+    const paddingTop = 16;
+    const paddingBottom = 28;
+    const plotWidth = Math.max(1, width - paddingLeft - paddingRight);
+    const plotHeight = Math.max(1, height - paddingTop - paddingBottom);
 
     if (points.length < 2) {
       ctx.fillStyle = '#93a9c9';
@@ -2059,23 +2090,45 @@ async def mobile():
     const values = points.map(p => p.v);
     const min = Math.min(...values);
     const max = Math.max(...values);
-    const padding = 18;
-    const xStep = (width - padding * 2) / (points.length - 1);
-    const range = Math.max(1, max - min);
+    const range = Math.max(1e-9, max - min);
+    const xStep = plotWidth / (points.length - 1);
+    const yFor = value => paddingTop + plotHeight - ((value - min) / range) * plotHeight;
+    const xFor = index => paddingLeft + index * xStep;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    ctx.fillRect(paddingLeft, paddingTop, plotWidth, plotHeight);
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const ratio = i / 4;
+      const y = paddingTop + plotHeight - ratio * plotHeight;
+      ctx.beginPath();
+      ctx.moveTo(paddingLeft, y);
+      ctx.lineTo(width - paddingRight, y);
+      ctx.stroke();
+
+      const labelValue = min + ratio * (max - min);
+      ctx.fillStyle = '#93a9c9';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(formatChartValue(metric, labelValue), paddingLeft - 8, y);
+    }
 
     ctx.strokeStyle = 'rgba(255,255,255,0.08)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(padding, height - padding);
-    ctx.lineTo(width - padding, height - padding);
+    ctx.moveTo(paddingLeft, paddingTop + plotHeight);
+    ctx.lineTo(width - paddingRight, paddingTop + plotHeight);
     ctx.stroke();
 
-    ctx.strokeStyle = color;
+    ctx.strokeStyle = metric.color;
     ctx.lineWidth = 2.5;
     ctx.beginPath();
     points.forEach((point, idx) => {
-      const x = padding + idx * xStep;
-      const y = height - padding - ((point.v - min) / range) * (height - padding * 2);
+      const x = xFor(idx);
+      const y = yFor(point.v);
       if (idx === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
@@ -2083,12 +2136,34 @@ async def mobile():
 
     ctx.fillStyle = 'rgba(255,255,255,0.14)';
     points.forEach((point, idx) => {
-      const x = padding + idx * xStep;
-      const y = height - padding - ((point.v - min) / range) * (height - padding * 2);
+      const x = xFor(idx);
+      const y = yFor(point.v);
       ctx.beginPath();
       ctx.arc(x, y, 2.2, 0, Math.PI * 2);
       ctx.fill();
     });
+
+    const firstTs = points[0].t;
+    const lastTs = points[points.length - 1].t;
+    ctx.fillStyle = '#93a9c9';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(formatTimeLabel(firstTs), paddingLeft, height - 18);
+    ctx.textAlign = 'right';
+    ctx.fillText(formatTimeLabel(lastTs), width - paddingRight, height - 18);
+
+    canvas._chartState = {
+      points,
+      min,
+      max,
+      xFor,
+      yFor,
+      paddingLeft,
+      paddingTop,
+      plotWidth,
+      plotHeight,
+    };
   }
 
   function renderCharts() {
@@ -2109,12 +2184,79 @@ async def mobile():
           </div>
           <div class="badge">${metric.unit}</div>
         </div>
-        <canvas class="chart"></canvas>
+        <div class="chart-wrap">
+          <canvas class="chart"></canvas>
+          <div class="chart-tooltip"></div>
+        </div>
       `;
       list.appendChild(card);
       const canvas = card.querySelector('canvas');
-      drawChart(canvas, smoothed, metric.color);
+      const tooltip = card.querySelector('.chart-tooltip');
+      drawChart(canvas, smoothed, metric);
+      attachChartHover(canvas, tooltip, metric);
     }
+  }
+
+  function formatChartValue(metric, value) {
+    if (value == null || Number.isNaN(value)) return '--';
+    if (metric && metric.key === 'lumina') {
+      return `${Math.max(0, Math.min(100, Math.round(value)))} % brightness`;
+    }
+    return metric ? metric.format(Number(value)) : String(value);
+  }
+
+  function formatTimeLabel(ts) {
+    if (!ts) return '';
+    const date = new Date(ts);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function attachChartHover(canvas, tooltip, metric) {
+    const state = canvas._chartState;
+    if (!state) return;
+
+    const hide = () => {
+      tooltip.style.display = 'none';
+    };
+
+    const showPoint = event => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const { points, xFor, yFor } = state;
+      let nearest = null;
+      let nearestDist = Infinity;
+      points.forEach((point, idx) => {
+        const px = xFor(idx);
+        const py = yFor(point.v);
+        const dist = Math.hypot(px - x, py - y);
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearest = { point, idx, px, py };
+        }
+      });
+      if (!nearest || nearestDist > 28) {
+        hide();
+        return;
+      }
+      tooltip.style.display = 'block';
+      tooltip.style.left = `${nearest.px}px`;
+      tooltip.style.top = `${nearest.py}px`;
+      tooltip.innerHTML = `
+        <div class="label">${escapeHtml(metric.label)}</div>
+        <div class="value">${escapeHtml(formatChartValue(metric, nearest.point.v))}</div>
+        <div class="small">${escapeHtml(new Date(nearest.point.t).toLocaleString())}</div>
+      `;
+    };
+
+    canvas.addEventListener('mousemove', showPoint);
+    canvas.addEventListener('mouseleave', hide);
+    canvas.addEventListener('touchstart', event => {
+      const touch = event.touches && event.touches[0];
+      if (!touch) return;
+      showPoint({ clientX: touch.clientX, clientY: touch.clientY });
+    }, { passive: true });
   }
 
   async function loadAndRender() {

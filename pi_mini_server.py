@@ -25,7 +25,7 @@ if not PI_TOKEN:
 
 app = FastAPI(title="Raspberry Pi Mini Server")
 
-URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "3")  # Schimbă cu hub-ul tău (1 sau 3)
+URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "2")  # Schimbă cu hub-ul tău (1 sau 2)
 
 import board
 import adafruit_dht
