@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import signal
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -74,6 +75,7 @@ camera_last_refresh_at: datetime | None = None
 camera_last_refresh_error: str | None = None
 camera_params_lock = threading.Lock()
 camera_capture_params: dict[str, object] = {}
+camera_capture_command: str | None = None
 
 
 @contextmanager
@@ -242,6 +244,23 @@ def append_if_present(args: list[str], flag: str, value):
     args.extend([flag, str(value)])
 
 
+def resolve_camera_capture_command() -> str:
+    global camera_capture_command
+
+    if camera_capture_command:
+        return camera_capture_command
+
+    for candidate in ("rpicam-jpeg", "libcamera-jpeg", "libcamera-still", "raspistill"):
+        if shutil.which(candidate):
+            camera_capture_command = candidate
+            return candidate
+
+    raise HTTPException(
+        status_code=503,
+        detail="No camera capture binary found. Install rpicam-jpeg, libcamera-jpeg, libcamera-still, or raspistill.",
+    )
+
+
 def capture_camera_image(
     output_path: str,
     *,
@@ -259,7 +278,7 @@ def capture_camera_image(
 ):
     temp_output_path = f"{output_path}.tmp"
     cmd = [
-        "rpicam-jpeg",
+        resolve_camera_capture_command(),
         "-o",
         temp_output_path,
         "-t",
@@ -345,9 +364,10 @@ def camera_refresh_loop():
     # Keep the latest image warm in the background so request handlers never wait on the camera.
     while True:
         try:
-            refresh_camera_snapshot()
-        except Exception:
-            pass
+            if not refresh_camera_snapshot() and camera_last_refresh_error:
+                print(f"Camera refresh failed: {camera_last_refresh_error}")
+        except Exception as exc:
+            print(f"Camera refresh loop error: {exc}")
         time.sleep(max(5, camera_refresh_interval_seconds))
 
 
@@ -467,6 +487,8 @@ async def get_image(request: Request):
     require_pi_token(request)
     remember_camera_params(request)
     ensure_camera_refresh_thread()
+    if not os.path.exists(CAMERA_PATH):
+        refresh_camera_snapshot()
     if not os.path.exists(CAMERA_PATH):
         detail = "No camera image available"
         if camera_last_refresh_error:
