@@ -51,7 +51,7 @@ if board is not None:
     peltier.value = True
 
     # Senzori
-    dht_device = adafruit_dht.DHT22(board.D24)
+    dht_device = adafruit_dht.DHT22(board.D4)
     bus = smbus2.SMBus(1)
 
 
