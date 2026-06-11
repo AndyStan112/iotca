@@ -20,7 +20,8 @@ LOCAL_PI_URL = os.getenv("LOCAL_PI_URL", "http://127.0.0.1:6000")
 PI_TOKEN = os.getenv("PI_TOKEN")
 DATA_INTERVAL_SECONDS = int(os.getenv("DATA_INTERVAL_SECONDS", "5"))
 COMMAND_INTERVAL_SECONDS = int(os.getenv("COMMAND_INTERVAL_SECONDS", "1"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10.0"))
+TELEMETRY_REQUEST_TIMEOUT = float(os.getenv("TELEMETRY_REQUEST_TIMEOUT", os.getenv("REQUEST_TIMEOUT", "10.0")))
+COMMAND_REQUEST_TIMEOUT = float(os.getenv("COMMAND_REQUEST_TIMEOUT", "2.0"))
 UPLOAD_CAMERA_SNAPSHOT = os.getenv("UPLOAD_CAMERA_SNAPSHOT", "true").lower() not in {"0", "false", "no"}
 
 if not SERVER_URL:
@@ -62,7 +63,7 @@ def set_cached_camera_defaults(camera_defaults: dict[str, Any] | None):
 
 def fetch_local_status():
     url = LOCAL_PI_URL.rstrip("/") + "/api/status"
-    response = requests.get(url, headers=PI_HEADERS, timeout=REQUEST_TIMEOUT)
+    response = requests.get(url, headers=PI_HEADERS, timeout=TELEMETRY_REQUEST_TIMEOUT)
     response.raise_for_status()
     payload = response.json()
     return payload.get("data") or {}
@@ -74,7 +75,7 @@ def fetch_device_config():
         url,
         headers=HEADERS,
         params={"device_name": DEVICE_NAME},
-        timeout=REQUEST_TIMEOUT,
+        timeout=TELEMETRY_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
@@ -87,7 +88,7 @@ def fetch_local_camera_snapshot(camera_defaults: dict[str, Any] | None = None):
         url,
         headers=PI_HEADERS,
         params=camera_defaults or {},
-        timeout=REQUEST_TIMEOUT,
+        timeout=TELEMETRY_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.content
@@ -130,7 +131,7 @@ def build_telemetry():
 
 def post_telemetry(data):
     url = SERVER_URL.rstrip("/") + "/api/telemetry"
-    response = requests.post(url, headers=HEADERS, json=data, timeout=REQUEST_TIMEOUT)
+    response = requests.post(url, headers=HEADERS, json=data, timeout=TELEMETRY_REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
@@ -150,7 +151,7 @@ def post_camera_snapshot(image_bytes: bytes):
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=REQUEST_TIMEOUT,
+        timeout=TELEMETRY_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()
@@ -162,7 +163,7 @@ def claim_commands(limit: int = 10):
         url,
         headers=HEADERS,
         json={"device_name": DEVICE_NAME, "limit": limit},
-        timeout=REQUEST_TIMEOUT,
+        timeout=COMMAND_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
@@ -175,7 +176,7 @@ def schedule_due_recurring_jobs(limit: int = 20):
         url,
         headers=HEADERS,
         json={"device_name": DEVICE_NAME, "limit": limit},
-        timeout=REQUEST_TIMEOUT,
+        timeout=TELEMETRY_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
@@ -188,7 +189,7 @@ def execute_local_command(command: str, parameters: dict[str, Any]):
         url,
         headers=PI_HEADERS,
         json={"command": command, "parameters": parameters},
-        timeout=REQUEST_TIMEOUT,
+        timeout=COMMAND_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()
@@ -205,7 +206,7 @@ def ack_command(command_id: int, status: str, result: dict[str, Any]):
             "status": status,
             "result": result,
         },
-        timeout=REQUEST_TIMEOUT,
+        timeout=COMMAND_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()
