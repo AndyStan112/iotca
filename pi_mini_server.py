@@ -231,6 +231,7 @@ def camera_preset_args(preset: str | None):
         "default": [],
         "bright": ["--brightness", "0.35", "--contrast", "0.15", "--saturation", "0.05", "--awb", "auto"],
         "dark": ["--brightness", "0.05", "--contrast", "0.25", "--saturation", "0.1", "--awb", "auto"],
+        "neutral": ["--awb", "auto", "--exposure", "normal", "--brightness", "0.1", "--contrast", "0.1", "--saturation", "0.05"],
         "warm": ["--brightness", "0.15", "--contrast", "0.2", "--saturation", "0.25", "--awb", "incandescent"],
         "cool": ["--brightness", "0.15", "--contrast", "0.2", "--saturation", "0.2", "--awb", "fluorescent"],
         "indoor": ["--brightness", "0.2", "--contrast", "0.15", "--saturation", "0.15", "--awb", "auto", "--exposure", "normal"],

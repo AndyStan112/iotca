@@ -136,10 +136,13 @@ def post_telemetry(data):
     return response.json()
 
 
-def post_camera_snapshot(image_bytes: bytes):
+def post_camera_snapshot(image_bytes: bytes, snapshot_kind: str = "latest"):
     if not UPLOAD_CAMERA_SNAPSHOT:
         return None
-    url = SERVER_URL.rstrip("/") + "/api/camera/snapshot"
+    if snapshot_kind == "calibration":
+        url = SERVER_URL.rstrip("/") + "/api/camera/calibration"
+    else:
+        url = SERVER_URL.rstrip("/") + "/api/camera/snapshot"
     payload = {
         "device_name": DEVICE_NAME,
         "image_base64": base64.b64encode(image_bytes).decode("ascii"),
@@ -225,7 +228,7 @@ def process_commands(camera_defaults: dict[str, Any] | None = None):
             if command == "camera_capture":
                 capture_params = merge_camera_defaults(camera_defaults, parameters)
                 snapshot = fetch_local_camera_snapshot(capture_params)
-                camera_result = post_camera_snapshot(snapshot)
+                camera_result = post_camera_snapshot(snapshot, snapshot_kind="calibration")
                 result = {
                     "status": "captured",
                     "camera_defaults": capture_params,

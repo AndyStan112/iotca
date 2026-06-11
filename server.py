@@ -426,6 +426,10 @@ def camera_snapshot_path(device_name: str) -> Path:
     return CAMERA_CACHE_DIR / f"{sanitize_device_name(device_name)}.jpg"
 
 
+def camera_calibration_snapshot_path(device_name: str) -> Path:
+    return CAMERA_CACHE_DIR / f"{sanitize_device_name(device_name)}-calibration.jpg"
+
+
 def leaf_favicon_svg() -> str:
     return """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
@@ -623,6 +627,45 @@ async def upload_camera_snapshot(request: Request):
     )
 
 
+@app.post("/api/camera/calibration")
+async def upload_camera_calibration_snapshot(request: Request):
+    data = await request.json()
+    device_name = data.get("device_name")
+    image_b64 = data.get("image_base64")
+    device_token = get_request_token(request)
+    if not device_token:
+        raise HTTPException(status_code=401, detail="Missing device token")
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+    if device_name not in ALLOWED_DEVICE_NAMES:
+        raise HTTPException(status_code=403, detail="Device not allowed")
+
+    if not image_b64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid image_base64") from exc
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    with db_session() as conn:
+        require_device_for_name(conn, device_name, device_token)
+
+    snapshot_path = camera_calibration_snapshot_path(device_name)
+    snapshot_path.write_bytes(image_bytes)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "device_name": device_name,
+            "bytes_saved": len(image_bytes),
+            "timestamp": now_iso(),
+        }
+    )
+
+
 @app.get("/api/camera/latest")
 async def latest_camera_snapshot(request: Request, device_name: str, _: bool = Depends(require_admin_session)):
     if device_name not in ALLOWED_DEVICE_NAMES:
@@ -630,6 +673,24 @@ async def latest_camera_snapshot(request: Request, device_name: str, _: bool = D
     snapshot_path = camera_snapshot_path(device_name)
     if not snapshot_path.exists():
         raise HTTPException(status_code=404, detail="No camera snapshot available")
+    return FileResponse(
+        snapshot_path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@app.get("/api/camera/calibration")
+async def latest_camera_calibration_snapshot(request: Request, device_name: str, _: bool = Depends(require_admin_session)):
+    if device_name not in ALLOWED_DEVICE_NAMES:
+        raise HTTPException(status_code=403, detail="Device not allowed")
+    snapshot_path = camera_calibration_snapshot_path(device_name)
+    if not snapshot_path.exists():
+        raise HTTPException(status_code=404, detail="No calibration snapshot available")
     return FileResponse(
         snapshot_path,
         media_type="image/jpeg",
@@ -1215,6 +1276,7 @@ async def index():
                   <option value="default">default</option>
                   <option value="bright">bright</option>
                   <option value="dark">dark</option>
+                  <option value="neutral">neutral</option>
                   <option value="warm">warm</option>
                   <option value="cool">cool</option>
                   <option value="indoor">indoor</option>
@@ -1511,7 +1573,7 @@ async def index():
             if (placeholder) placeholder.style.display = 'grid';
             if (status) status.textContent = 'Calibration capture failed';
           };
-          img.src = `/api/camera/latest?device_name=${encodeURIComponent(deviceName)}&t=${Date.now()}`;
+          img.src = `/api/camera/calibration?device_name=${encodeURIComponent(deviceName)}&t=${Date.now()}`;
         }
       }, 7000);
     } catch (err) {

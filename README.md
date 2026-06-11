@@ -18,6 +18,7 @@ The database schema in `migrations/` is left unchanged.
 - The Pi mini-server exposes `/api/status`, `/api/data`, `/api/control`, and `/api/camera`.
 - The Pi mini-server also exposes `/test_camera` for camera calibration captures, but it does not host a standalone UI anymore.
 - Camera calibration from the cloud UI works by saving defaults in the database and queuing a `camera_capture` command that the Pi exporter executes on its next poll.
+- Calibration captures are stored separately from the normal live snapshot, so the test preview shows the exact preset you picked.
 - Recurring jobs live in the cloud database, and the exporter turns due jobs into regular queued commands. You can start and stop them from the cloud UI without deleting the schedule.
 - Pending one-off commands can be canceled from the cloud UI before the exporter claims them.
 - The exporter polls the Pi mini-server locally, then posts telemetry to the cloud server.
@@ -147,3 +148,4 @@ uv run python3 scripts/pi_exporter.py
 - Commands are stored in the `commands` table and then claimed by the Pi exporter, so you get a small audit trail in the cloud UI without exposing the Pi directly.
 - The Pi exporter uses separate loops for telemetry and command polling, so command checks are not blocked by slower exports.
 - If the image looks blue, set `PI_CAMERA_PRESET=plant` or `PI_CAMERA_PRESET=indoor` to bias white balance and saturation toward a more natural feed.
+- `neutral` is a good first preset if you want a conservative starting point before fine-tuning.
