@@ -11,7 +11,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 
-FROM python:3.14-slim-bookworm AS runtime
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS runtime
 
 WORKDIR /app
 
