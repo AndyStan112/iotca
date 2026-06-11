@@ -57,6 +57,7 @@ DEVICE_TOKEN=secret-device-token
 LOCAL_PI_URL=http://127.0.0.1:6000
 PI_TOKEN=secret-pi-token
 DATA_INTERVAL_SECONDS=5
+COMMAND_INTERVAL_SECONDS=1
 REQUEST_TIMEOUT=10.0
 UPLOAD_CAMERA_SNAPSHOT=true
 PI_SERVER_HOST=0.0.0.0
@@ -109,6 +110,9 @@ The mobile PWA lives at `/mobile`.
 uv run python3 -m uvicorn pi_mini_server:app --host 0.0.0.0 --port 6000
 ```
 
+If you use `scripts/run_pi_background.sh`, it prefers the project virtualenv at `.venv/bin/python`
+so it keeps working even from a root shell where `uv` is not on `PATH`.
+
 ## Allow `pi` to control the pump
 
 The mini-server uses `uhubctl` to switch the pump hub on and off.
@@ -138,3 +142,4 @@ uv run python3 scripts/pi_exporter.py
 - `old_server.py` is kept as a reference copy.
 - The Pi mini-server keeps the hardware comments and control semantics from the old monolithic server.
 - Commands are stored in the `commands` table and then claimed by the Pi exporter, so you get a small audit trail in the cloud UI without exposing the Pi directly.
+- The Pi exporter uses separate loops for telemetry and command polling, so command checks are not blocked by slower exports.

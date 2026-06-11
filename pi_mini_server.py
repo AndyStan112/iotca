@@ -5,6 +5,8 @@ import os
 import subprocess
 import tempfile
 import signal
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -62,6 +64,16 @@ bus = None
 PCF8591_ADDRESS = 0x48
 
 pump_state = False
+auto_off_timers: dict[str, threading.Timer] = {}
+auto_off_lock = threading.Lock()
+camera_refresh_lock = threading.Lock()
+camera_refresh_thread: threading.Thread | None = None
+camera_refresh_interval_seconds = int(os.getenv("PI_CAMERA_REFRESH_SECONDS", "10"))
+camera_capture_timeout_seconds = int(os.getenv("PI_CAMERA_CAPTURE_TIMEOUT_SECONDS", "30"))
+camera_last_refresh_at: datetime | None = None
+camera_last_refresh_error: str | None = None
+camera_params_lock = threading.Lock()
+camera_capture_params: dict[str, object] = {}
 
 
 @contextmanager
@@ -165,6 +177,36 @@ def set_pump(on: bool):
     return {"pompa": on}
 
 
+def cancel_auto_off(command: str):
+    with auto_off_lock:
+        timer = auto_off_timers.pop(command, None)
+    if timer is not None:
+        timer.cancel()
+
+
+def schedule_auto_off(command: str, seconds: int):
+    seconds = max(1, int(seconds))
+
+    def _turn_off():
+        try:
+            if command == "pompa":
+                set_pump(False)
+            elif command == "incalzire":
+                set_heater(False)
+            elif command == "racire":
+                set_cooler(False)
+        finally:
+            with auto_off_lock:
+                auto_off_timers.pop(command, None)
+
+    cancel_auto_off(command)
+    timer = threading.Timer(seconds, _turn_off)
+    timer.daemon = True
+    with auto_off_lock:
+        auto_off_timers[command] = timer
+    timer.start()
+
+
 def set_heater(on: bool):
     if heater is not None:
         heater.value = not on  # Active-Low: False pornește curentul
@@ -215,10 +257,11 @@ def capture_camera_image(
     shutter: int | None = None,
     gain: float | None = None,
 ):
+    temp_output_path = f"{output_path}.tmp"
     cmd = [
         "rpicam-jpeg",
         "-o",
-        output_path,
+        temp_output_path,
         "-t",
         "500",
         "--width",
@@ -239,16 +282,89 @@ def capture_camera_image(
     append_if_present(cmd, "--shutter", shutter)
     append_if_present(cmd, "--gain", gain)
 
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=True,
-        timeout=15,
-    )
-    if not os.path.exists(output_path):
-        raise HTTPException(status_code=500, detail="Camera capture failed")
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=camera_capture_timeout_seconds,
+        )
+        if not os.path.exists(temp_output_path):
+            raise HTTPException(status_code=503, detail="Camera capture did not produce an image")
+        os.replace(temp_output_path, output_path)
+    except subprocess.TimeoutExpired as exc:
+        if os.path.exists(temp_output_path):
+            try:
+                os.unlink(temp_output_path)
+            except Exception:
+                pass
+        if os.path.exists(output_path):
+            return
+        raise HTTPException(status_code=503, detail="Camera capture timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        if os.path.exists(temp_output_path):
+            try:
+                os.unlink(temp_output_path)
+            except Exception:
+                pass
+        if os.path.exists(output_path):
+            return
+        detail = "Camera capture failed"
+        if exc.stderr:
+            detail = f"{detail}: {exc.stderr.strip()}"
+        raise HTTPException(status_code=503, detail=detail) from exc
+
+
+def refresh_camera_snapshot() -> bool:
+    global camera_last_refresh_at, camera_last_refresh_error
+
+    if not camera_refresh_lock.acquire(blocking=False):
+        return False
+
+    try:
+        try:
+            with camera_params_lock:
+                params = dict(camera_capture_params)
+            capture_camera_image(CAMERA_PATH, **params)
+            camera_last_refresh_at = datetime.now(timezone.utc)
+            camera_last_refresh_error = None
+            return True
+        except HTTPException as exc:
+            camera_last_refresh_error = str(exc.detail)
+            return False
+        except Exception as exc:
+            camera_last_refresh_error = str(exc)
+            return False
+    finally:
+        camera_refresh_lock.release()
+
+
+def camera_refresh_loop():
+    # Keep the latest image warm in the background so request handlers never wait on the camera.
+    while True:
+        try:
+            refresh_camera_snapshot()
+        except Exception:
+            pass
+        time.sleep(max(5, camera_refresh_interval_seconds))
+
+
+def ensure_camera_refresh_thread():
+    global camera_refresh_thread
+    if camera_refresh_thread and camera_refresh_thread.is_alive():
+        return
+    camera_refresh_thread = threading.Thread(target=camera_refresh_loop, daemon=True)
+    camera_refresh_thread.start()
+
+
+def remember_camera_params(request: Request):
+    params = parse_camera_params(request)
+    with camera_params_lock:
+        camera_capture_params.clear()
+        camera_capture_params.update(params)
+    return params
 
 
 def parse_camera_params(request: Request):
@@ -325,6 +441,15 @@ async def control(request: Request):
     else:
         raise HTTPException(status_code=400, detail=f"Unknown command: {command}")
 
+    duration_seconds = parameters.get("duration_seconds")
+    if is_on:
+        if duration_seconds:
+            schedule_auto_off(command, duration_seconds)
+        else:
+            cancel_auto_off(command)
+    else:
+        cancel_auto_off(command)
+
     return JSONResponse(
         {
             "status": "ok",
@@ -340,8 +465,13 @@ async def control(request: Request):
 async def get_image(request: Request):
     """Face o poză în timp real și o trimite direct către client."""
     require_pi_token(request)
-    params = parse_camera_params(request)
-    capture_camera_image(CAMERA_PATH, **params)
+    remember_camera_params(request)
+    ensure_camera_refresh_thread()
+    if not os.path.exists(CAMERA_PATH):
+        detail = "No camera image available"
+        if camera_last_refresh_error:
+            detail = f"{detail}: {camera_last_refresh_error}"
+        raise HTTPException(status_code=503, detail=detail)
     return FileResponse(CAMERA_PATH, media_type="image/jpeg")
 
 
@@ -350,11 +480,13 @@ async def get_image(request: Request):
 async def test_camera(request: Request):
     """Capture a fresh image with tunable settings for camera calibration."""
     require_pi_token(request)
-    params = parse_camera_params(request)
+    params = remember_camera_params(request)
     fd, temp_path = tempfile.mkstemp(prefix="iotca-camera-", suffix=".jpg")
     os.close(fd)
     try:
         capture_camera_image(temp_path, **params)
+        if not os.path.exists(temp_path):
+            raise HTTPException(status_code=503, detail="No camera image available")
         return FileResponse(
             temp_path,
             media_type="image/jpeg",
@@ -374,6 +506,11 @@ async def test_camera(request: Request):
 @app.get("/")
 async def index():
     return JSONResponse({"message": "Raspberry Pi mini-server is running", "version": "2.0"})
+
+
+@app.on_event("startup")
+async def startup_background_tasks():
+    ensure_camera_refresh_thread()
 
 
 if __name__ == "__main__":

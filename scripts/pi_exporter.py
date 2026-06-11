@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import os
 import sys
-import time
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +19,7 @@ DEVICE_TOKEN = os.getenv("DEVICE_TOKEN")
 LOCAL_PI_URL = os.getenv("LOCAL_PI_URL", "http://127.0.0.1:6000")
 PI_TOKEN = os.getenv("PI_TOKEN")
 DATA_INTERVAL_SECONDS = int(os.getenv("DATA_INTERVAL_SECONDS", "5"))
+COMMAND_INTERVAL_SECONDS = int(os.getenv("COMMAND_INTERVAL_SECONDS", "1"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "10.0"))
 UPLOAD_CAMERA_SNAPSHOT = os.getenv("UPLOAD_CAMERA_SNAPSHOT", "true").lower() not in {"0", "false", "no"}
 
@@ -43,6 +44,20 @@ PI_HEADERS = {
     "Authorization": f"Bearer {PI_TOKEN}",
     "Content-Type": "application/json",
 }
+
+camera_defaults_cache: dict[str, Any] = {}
+camera_defaults_lock = threading.Lock()
+
+
+def get_cached_camera_defaults() -> dict[str, Any]:
+    with camera_defaults_lock:
+        return dict(camera_defaults_cache)
+
+
+def set_cached_camera_defaults(camera_defaults: dict[str, Any] | None):
+    with camera_defaults_lock:
+        camera_defaults_cache.clear()
+        camera_defaults_cache.update(camera_defaults or {})
 
 
 def fetch_local_status():
@@ -228,20 +243,23 @@ def process_commands(camera_defaults: dict[str, Any] | None = None):
             print(f"Command {command_id} failed:", exc)
 
 
-def main():
-    print(f"Starting Raspberry exporter for {DEVICE_NAME}")
-    while True:
+def telemetry_loop(stop_event: threading.Event):
+    while not stop_event.is_set():
         try:
             camera_defaults = fetch_device_config()
+            set_cached_camera_defaults(camera_defaults)
+
             telemetry = build_telemetry()
             result = post_telemetry(telemetry)
             print("Telemetry sent:", result)
+
             try:
                 scheduled = schedule_due_recurring_jobs()
                 if scheduled:
                     print("Recurring jobs scheduled:", len(scheduled))
             except Exception as exc:
                 print("Recurring schedule error:", exc)
+
             try:
                 snapshot = fetch_local_camera_snapshot(camera_defaults)
                 camera_result = post_camera_snapshot(snapshot)
@@ -251,16 +269,54 @@ def main():
                 print("Camera upload error:", exc)
         except KeyboardInterrupt:
             print("Exporter stopped by user")
+            stop_event.set()
             break
         except Exception as exc:
             print("Exporter error:", exc)
 
+        if stop_event.wait(DATA_INTERVAL_SECONDS):
+            break
+
+
+def command_loop(stop_event: threading.Event):
+    while not stop_event.is_set():
         try:
-            process_commands(camera_defaults)
+            process_commands(get_cached_camera_defaults())
+        except KeyboardInterrupt:
+            print("Command poller stopped by user")
+            stop_event.set()
+            break
         except Exception as exc:
             print("Command processing error:", exc)
 
-        time.sleep(DATA_INTERVAL_SECONDS)
+        if stop_event.wait(COMMAND_INTERVAL_SECONDS):
+            break
+
+
+def main():
+    print(f"Starting Raspberry exporter for {DEVICE_NAME}")
+    stop_event = threading.Event()
+
+    try:
+        set_cached_camera_defaults(fetch_device_config())
+    except Exception as exc:
+        print("Initial camera config error:", exc)
+
+    telemetry_thread = threading.Thread(target=telemetry_loop, args=(stop_event,), daemon=True)
+    command_thread = threading.Thread(target=command_loop, args=(stop_event,), daemon=True)
+
+    telemetry_thread.start()
+    command_thread.start()
+
+    try:
+        while telemetry_thread.is_alive() or command_thread.is_alive():
+            telemetry_thread.join(timeout=1)
+            command_thread.join(timeout=1)
+    except KeyboardInterrupt:
+        print("Exporter stopped by user")
+        stop_event.set()
+        telemetry_thread.join(timeout=5)
+        command_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
