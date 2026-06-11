@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import signal
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
@@ -27,12 +29,25 @@ app = FastAPI(title="Raspberry Pi Mini Server")
 
 URMARESTE_HUB_USB = os.getenv("PI_USB_HUB", "3")  # Hub-ul pompei; default 3.
 
-subprocess.run(
-    ["sudo", "uhubctl", "-l", URMARESTE_HUB_USB, "-a", "0"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    check=False,
-)
+def run_uhubctl(action: str):
+    cmd = ["uhubctl", "-l", URMARESTE_HUB_USB, "-a", action]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+
+    subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=5,
+    )
+
+
+try:
+    # Never block startup on sudo prompts or a flaky USB hub.
+    run_uhubctl("0")
+except Exception:
+    pass
 
 import board
 import adafruit_dht
@@ -47,6 +62,20 @@ bus = None
 PCF8591_ADDRESS = 0x48
 
 pump_state = False
+
+
+@contextmanager
+def time_limit(seconds: int):
+    def _handler(signum, frame):
+        raise TimeoutError(f"operation timed out after {seconds}s")
+
+    previous_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 if board is not None:
     heater = digitalio.DigitalInOut(board.D17)
@@ -80,18 +109,23 @@ def read_light():
     try:
         if bus is None:
             return 127
-        bus.write_byte(PCF8591_ADDRESS, 0x40)
-        bus.read_byte(PCF8591_ADDRESS)
-        return bus.read_byte(PCF8591_ADDRESS)
+        with time_limit(2):
+            bus.write_byte(PCF8591_ADDRESS, 0x40)
+            bus.read_byte(PCF8591_ADDRESS)
+            return bus.read_byte(PCF8591_ADDRESS)
     except Exception:
         return 127
 
 
 def read_sensors():
     try:
-        temp = dht_device.temperature if dht_device is not None else None
-        humidity = dht_device.humidity if dht_device is not None else None
+        with time_limit(2):
+            temp = dht_device.temperature if dht_device is not None else None
+            humidity = dht_device.humidity if dht_device is not None else None
     except RuntimeError:
+        temp = None
+        humidity = None
+    except TimeoutError:
         temp = None
         humidity = None
 
@@ -124,12 +158,10 @@ def set_pump(on: bool):
     global pump_state
     pump_state = on
     action = "1" if on else "0"
-    subprocess.run(
-        ["sudo", "uhubctl", "-l", URMARESTE_HUB_USB, "-a", action],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    try:
+        run_uhubctl(action)
+    except Exception:
+        pass
     return {"pompa": on}
 
 
@@ -213,6 +245,7 @@ def capture_camera_image(
         stderr=subprocess.PIPE,
         text=True,
         check=True,
+        timeout=15,
     )
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Camera capture failed")
