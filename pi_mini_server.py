@@ -22,6 +22,7 @@ PI_TOKEN = os.getenv("PI_TOKEN")
 SERVER_HOST = os.getenv("PI_SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("PI_SERVER_PORT", "6000"))
 CAMERA_PATH = os.getenv("PI_CAMERA_PATH", "/tmp/local_plant.jpg")
+PI_CAMERA_PRESET = os.getenv("PI_CAMERA_PRESET", "indoor")
 SENSOR_FALLBACK_TEMP = float(os.getenv("SENSOR_FALLBACK_TEMP", "24.5"))
 SENSOR_FALLBACK_HUMIDITY = float(os.getenv("SENSOR_FALLBACK_HUMIDITY", "55.0"))
 
@@ -235,7 +236,8 @@ def camera_preset_args(preset: str | None):
         "indoor": ["--brightness", "0.2", "--contrast", "0.15", "--saturation", "0.15", "--awb", "auto", "--exposure", "normal"],
         "plant": ["--brightness", "0.2", "--contrast", "0.2", "--saturation", "0.3", "--awb", "auto", "--sharpness", "1.0"],
     }
-    return presets.get((preset or "default").lower(), [])
+    selected = (preset or PI_CAMERA_PRESET or "default").lower()
+    return presets.get(selected, presets["default"])
 
 
 def append_if_present(args: list[str], flag: str, value):
@@ -485,16 +487,29 @@ async def control(request: Request):
 async def get_image(request: Request):
     """Face o poză în timp real și o trimite direct către client."""
     require_pi_token(request)
-    remember_camera_params(request)
+    params = remember_camera_params(request)
     ensure_camera_refresh_thread()
-    if not os.path.exists(CAMERA_PATH):
-        refresh_camera_snapshot()
-    if not os.path.exists(CAMERA_PATH):
-        detail = "No camera image available"
-        if camera_last_refresh_error:
-            detail = f"{detail}: {camera_last_refresh_error}"
-        raise HTTPException(status_code=503, detail=detail)
-    return FileResponse(CAMERA_PATH, media_type="image/jpeg")
+
+    fd, temp_path = tempfile.mkstemp(prefix="iotca-camera-", suffix=".jpg")
+    os.close(fd)
+    try:
+        capture_camera_image(temp_path, **params)
+        if not os.path.exists(temp_path):
+            raise HTTPException(status_code=503, detail="No camera image available")
+        return FileResponse(
+            temp_path,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+            background=BackgroundTask(os.unlink, temp_path),
+        )
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
 
 
 @app.get("/test_camera")
