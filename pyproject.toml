@@ -5,12 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "adafruit-blinka>=9.1.0",
+    "adafruit-circuitpython-dht>=4.0.12",
     "agno>=2.6.13",
     "fastapi>=0.107.0",
     "openai>=2.41.1",
     "psycopg2-binary>=2.9.12",
     "python-dotenv>=1.2.2",
     "requests>=2.31.0",
+    "smbus2>=0.6.1",
     "sqlalchemy>=2.0.50",
     "uvicorn[standard]>=0.23.0",
 ]
